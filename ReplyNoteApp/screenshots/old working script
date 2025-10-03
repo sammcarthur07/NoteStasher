@@ -1,0 +1,165 @@
+/**
+ * Runs every minute (or chosen frequency) to track document edits, timers, and status.
+ * It searches for the clock icon (⏰). If found, updates only the tracking blocks (top/bottom).
+ * Wrapped in a try/catch to avoid partial property updates if an error occurs.
+ */
+function updateDocChangeTimer() {
+  try {
+    // --- 1) Setup references and retrieve persisted properties ---
+    const doc   = DocumentApp.getActiveDocument();
+    const body  = doc.getBody();
+    const props = PropertiesService.getDocumentProperties();
+    const SPEED_FACTOR = 1; // Adjust as needed
+
+    // Retrieve stored timer values
+    let lastStoredContent = props.getProperty('lastContent')   || '';
+    let lastChangeTimeStr  = props.getProperty('lastChangeTime') || '';
+    let longestTimeStr     = props.getProperty('longestTime')   || '';
+    let lastLiveTimeStr    = props.getProperty('lastLiveTime')  || '';
+
+    let lastChangeTime = lastChangeTimeStr ? parseInt(lastChangeTimeStr, 10) : null;
+    let longestTime    = longestTimeStr    ? parseInt(longestTimeStr, 10)    : 0;
+    let lastLiveTime   = lastLiveTimeStr   ? parseInt(lastLiveTimeStr, 10)   : 0;
+
+    // --- 2) Bail out if no ⏰ anywhere ---
+    let fullText = body.getText();
+    if (fullText.indexOf("⏰") === -1) {
+      Logger.log("No tracking block found. Exiting update.");
+      return;
+    }
+
+    // --- 3) Strip out ALL of our own ⏰‑blocks (top & bottom) before diff’ing ---
+    let cleanText = fullText
+      .replace(/^⏰[\s\S]*?Status: .*?(?:\n|$)/, '')  // remove top block
+      .replace(/⏰[\s\S]*?Status: .*?(?:\n|$)$/, ''); // remove bottom block
+
+    let currentContent = cleanText;
+
+    // --- 4) Big‑change only if the user’s length difference > 5 characters ---
+    let bigChange = false;
+    if (lastStoredContent) {
+      let lengthDiff = Math.abs(currentContent.length - lastStoredContent.length);
+      Logger.log("lengthDiff = " + lengthDiff);
+      if (lengthDiff > 5) {
+        bigChange = true;
+      }
+    }
+
+    // --- 5) Update lastChangeTime / lastLiveTime on bigChange ---
+    let now = Date.now();
+    if (bigChange) {
+      lastChangeTime = now;
+      lastLiveTime   = now;
+    } else if (!lastChangeTime) {
+      lastChangeTime = now;
+    }
+
+    // Prepare new content for storage
+    let newStoredContent = currentContent;
+
+    // --- 6) Compute elapsed + longest times ---
+    let elapsedTime = Math.max((now - lastChangeTime) * SPEED_FACTOR, 0);
+    let formattedTime = formatElapsedTime(elapsedTime);
+
+    let newLongestTime = Math.max(longestTime, elapsedTime);
+    let longestFormattedTime = formatElapsedTime(newLongestTime);
+
+    // Timestamp in Brisbane
+    let timestampStr = Utilities.formatDate(
+      new Date(lastChangeTime),
+      "Australia/Brisbane",
+      'dd/MM/yyyy hh:mm:ss a'
+    );
+
+    // Live vs Away
+    let status = elapsedTime < 2 * 60 * 1000 ? "Live" : "Away";
+
+    // --- 7) Build the new tracking block text ---
+    let newTrackingText =
+      `⏰\n` +
+      `Last edit: ${timestampStr} — ${formattedTime} ago\n` +
+      `Longest time away: ${longestFormattedTime}\n` +
+      `Status: ${status}`;
+
+    // --- 8) Update top block ---
+    let topRange = body.findText("^⏰");
+    if (topRange) {
+      let topPara = topRange.getElement().getParent();
+      if (topPara.getType() !== DocumentApp.ElementType.PARAGRAPH) {
+        topPara = topPara.getParent();
+      }
+      topPara.asParagraph().setText(newTrackingText);
+    } else {
+      body.insertParagraph(0, newTrackingText);
+    }
+
+    // --- 9) Update bottom block ---
+    let paras = body.getParagraphs();
+    let bottomUpdated = false;
+    for (let i = paras.length - 1; i >= 0; i--) {
+      if (paras[i].getText().startsWith("⏰")) {
+        paras[i].setText(newTrackingText);
+        bottomUpdated = true;
+        break;
+      }
+    }
+    if (!bottomUpdated) {
+      body.appendParagraph(newTrackingText);
+    }
+
+    // --- 10) Commit new properties ---
+    props.setProperty('lastChangeTime', lastChangeTime.toString());
+    props.setProperty('lastLiveTime',  lastLiveTime.toString());
+    props.setProperty('longestTime',   newLongestTime.toString());
+    props.setProperty('lastContent',   newStoredContent);
+
+    Logger.log(
+      "Updated: " + timestampStr +
+      " | Elapsed: " + formattedTime +
+      " | Longest: " + longestFormattedTime +
+      " | Status: " + status
+    );
+
+  } catch (error) {
+    Logger.log("updateDocChangeTimer error: " + error);
+  }
+}
+
+/**
+ * Resets all timers (clearing stored timer values) without modifying the document.
+ */
+function resetAllTimers() {
+  const props = PropertiesService.getDocumentProperties();
+  props.deleteProperty('lastChangeTime');
+  props.deleteProperty('lastLiveTime');
+  props.deleteProperty('longestTime');
+  props.deleteProperty('lastContent');
+  Logger.log("All timers reset. Please manually remove the old timers from the document if needed.");
+}
+
+/**
+ * Formats elapsed time in "X years, X days, X hours, X min, X sec".
+ */
+function formatElapsedTime(ms) {
+  const sec  = 1000,
+        min  = 60 * sec,
+        hour = 60 * min,
+        day  = 24 * hour,
+        year = 365 * day;
+
+  let years   = Math.floor(ms / year);   ms %= year;
+  let days    = Math.floor(ms / day);    ms %= day;
+  let hours   = Math.floor(ms / hour);   ms %= hour;
+  let minutes = Math.floor(ms / min);    ms %= min;
+  let seconds = Math.floor(ms / sec);
+
+  let parts = [];
+  if (years   > 0) parts.push(`${years} years`);
+  if (days    > 0) parts.push(`${days} days`);
+  if (hours   > 0) parts.push(`${hours} hours`);
+  if (minutes > 0) parts.push(`${minutes} min`);
+  parts.push(`${seconds} sec`);
+
+  return parts.join(", ");
+}
+
