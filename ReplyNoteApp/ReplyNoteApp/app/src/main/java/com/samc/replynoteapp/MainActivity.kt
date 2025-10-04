@@ -61,6 +61,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
@@ -73,6 +74,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.relocation.BringIntoViewRequester
@@ -84,12 +86,13 @@ import androidx.core.content.ContextCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.launch
 import kotlin.coroutines.resume
 import android.net.Uri
 import android.graphics.BitmapFactory
@@ -101,6 +104,9 @@ import com.samc.replynoteapp.HistoryAttachment
 import com.samc.replynoteapp.R
 // Ensure this line matches your project's theme file and new package structure
 import com.samc.replynoteapp.ui.theme.ReplyNoteAppTheme // <-- UPDATED PACKAGE FOR THEME
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
     
@@ -671,6 +677,7 @@ private suspend fun sendCurrent(
 
         // 2. Now, decide which sending method to use based on the configuration.
         val selectedDocId = SharedPreferencesHelper.loadSelectedDocId(context) ?: "unsynced_1"
+        val selectedDocName = SharedPreferencesHelper.loadDocDisplayName(context, selectedDocId)
         val appsScriptUrl = SharedPreferencesHelper.loadAppsScriptUrl(context)
         val isOnline = NetworkUtils.isNetworkAvailable(context)
 
@@ -708,7 +715,7 @@ private suspend fun sendCurrent(
                     draftRepo.saveDraftAttachmentsJson("[]")
                     onPlainSuccess()
                     // Save to history
-                    SharedPreferencesHelper.saveMessageToHistory(context, html)
+                    SharedPreferencesHelper.saveMessageToHistory(context, html, selectedDocId, selectedDocName)
                     val preview = htmlToPlainSnippetLocal(html, 500).ifBlank { messageText.take(500) }
                     SharedPreferencesHelper.saveDocLastMessage(context, selectedDocId, preview)
                     refreshDocNotificationIfEnabled(context, selectedDocId)
@@ -786,7 +793,14 @@ private suspend fun sendCurrent(
             MessageQueueManager.addToQueue(context, selectedDocId, mergedBlocks, true, messageText.take(200))
             val reason = if (!isOnline) "offline - will sync when connected" else "no document URL configured"
             Toast.makeText(context, "Message queued ($reason)", Toast.LENGTH_LONG).show()
-            SharedPreferencesHelper.saveRichMessageToHistory(context, html, messageText, emptyList())
+            SharedPreferencesHelper.saveRichMessageToHistory(
+                context,
+                html,
+                plainPreview = messageText,
+                attachments = emptyList(),
+                docId = selectedDocId,
+                docName = selectedDocName
+            )
             SharedPreferencesHelper.updateMessageHistoryStatus(context, 0, "pending")
             val preview = htmlToPlainSnippetLocal(html, 200).ifBlank { messageText.take(200) }
             SharedPreferencesHelper.saveDocLastMessage(context, selectedDocId, "Queued: $preview")
@@ -817,7 +831,14 @@ private suspend fun sendCurrent(
                     }
                 }
             } catch (_: Exception) {}
-            SharedPreferencesHelper.saveSendingRichHistoryItem(context, sessionId, htmlPreview = html, attachments = attachList)
+            SharedPreferencesHelper.saveSendingRichHistoryItem(
+                context,
+                sessionId,
+                htmlPreview = html,
+                attachments = attachList,
+                docId = selectedDocId,
+                docName = selectedDocName
+            )
             try {
                 val ajson = draftRepo.getDraftAttachmentsJson()
                 if (ajson.isNotBlank()) {
@@ -852,13 +873,14 @@ private suspend fun sendCurrent(
     } else {
         // Plain text send - always use hub mode
         val selectedDocId = SharedPreferencesHelper.loadSelectedDocId(context) ?: "unsynced_1"
+        val selectedDocName = SharedPreferencesHelper.loadDocDisplayName(context, selectedDocId)
         val isOnline = NetworkUtils.isNetworkAvailable(context)
 
         if (selectedDocId.startsWith("unsynced") || !isOnline) {
             MessageQueueManager.addToQueue(context, selectedDocId, messageText, false, messageText.take(200))
             val reason = if (!isOnline) "offline - will sync when connected" else "no document URL configured"
             Toast.makeText(context, "Message queued ($reason)", Toast.LENGTH_LONG).show()
-            SharedPreferencesHelper.saveMessageToHistory(context, messageText)
+            SharedPreferencesHelper.saveMessageToHistory(context, messageText, selectedDocId, selectedDocName)
             SharedPreferencesHelper.updateMessageHistoryStatus(context, 0, "pending")
             SharedPreferencesHelper.saveDocLastMessage(context, selectedDocId, "Queued: ${messageText.take(200)}")
             refreshDocNotificationIfEnabled(context, selectedDocId)
@@ -870,7 +892,7 @@ private suspend fun sendCurrent(
             withContext(Dispatchers.Main) {
                 result.onSuccess {
                     Toast.makeText(context, "Message sent successfully!", Toast.LENGTH_SHORT).show()
-                    SharedPreferencesHelper.saveMessageToHistory(context, messageText)
+                    SharedPreferencesHelper.saveMessageToHistory(context, messageText, selectedDocId, selectedDocName)
                     SharedPreferencesHelper.saveDocLastMessage(context, selectedDocId, messageText.take(500))
                     refreshDocNotificationIfEnabled(context, selectedDocId)
                     onPlainSuccess()
@@ -2232,6 +2254,7 @@ fun HistoryScreen(messageHistory: List<MessageHistoryItem>) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun MessageCard(item: MessageHistoryItem) {
     var showDialog by remember { mutableStateOf(false) }
@@ -2244,11 +2267,54 @@ fun MessageCard(item: MessageHistoryItem) {
         "pending" -> "⏰" to Color(0xFF9E9E9E) // Gray clock
         else -> "" to Color.Transparent
     }
+
+    val clipboardManager = LocalClipboardManager.current
+    val context = LocalContext.current
+    val vibrator = remember(context) { context.getSystemService(VIBRATOR_SERVICE) as? Vibrator }
+    val copyableText = remember(item.text, item.html) {
+        when {
+            item.text.isNotBlank() -> item.text
+            !item.html.isNullOrBlank() -> htmlToPlainSnippetLocal(item.html!!, 1000)
+            else -> ""
+        }
+    }
+    val toastPreview = remember(copyableText) {
+        copyableText
+            .replace("\n", " ")
+            .trim()
+            .let { if (it.length > 60) it.take(57) + "…" else it }
+    }
     
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable { showDialog = true }
+            .pointerInput(copyableText) {
+                detectTapGestures(
+                    onPress = {
+                        val pressResult = withTimeoutOrNull(1000L) { tryAwaitRelease() }
+                        when (pressResult) {
+                            true -> showDialog = true
+                            false -> Unit // gesture cancelled (e.g., scroll)
+                            null -> {
+                                if (copyableText.isNotBlank()) {
+                                    clipboardManager.setText(AnnotatedString(copyableText))
+                                    val toastText = if (toastPreview.isNotEmpty()) "Copied: $toastPreview" else "Copied to clipboard"
+                                    Toast.makeText(context, toastText, Toast.LENGTH_SHORT).show()
+                                    vibrator?.let {
+                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                            it.vibrate(VibrationEffect.createOneShot(1000, VibrationEffect.DEFAULT_AMPLITUDE))
+                                        } else {
+                                            @Suppress("DEPRECATION")
+                                            it.vibrate(1000)
+                                        }
+                                    }
+                                }
+                                tryAwaitRelease()
+                            }
+                        }
+                    }
+                )
+            }
             .border(
                 width = 1.dp,
                 color = Color(0xFF98FB98), // Pale green
@@ -2343,7 +2409,6 @@ fun MessageCard(item: MessageHistoryItem) {
 
             // Styled preview for HTML content (Option A): only when there are no attachments
             if (item.attachments.isEmpty() && item.format == "html" && !item.html.isNullOrBlank()) {
-                val context = LocalContext.current
                 AndroidView(
                     factory = { ctx ->
                         android.webkit.WebView(ctx).apply {
@@ -2385,14 +2450,36 @@ fun MessageCard(item: MessageHistoryItem) {
                 )
             }
             Spacer(modifier = Modifier.height(8.dp))
+            val dateLabel = remember(item.timestamp) {
+                val formatter = SimpleDateFormat("MMM dd, yyyy • hh:mm a", Locale.getDefault())
+                formatter.format(Date(item.timestamp))
+            }
+            val docLabel = remember(item.docId, item.docName) {
+                when {
+                    !item.docName.isNullOrBlank() -> item.docName
+                    !item.docId.isNullOrBlank() -> item.docId
+                    else -> null
+                }
+            }
             Text(
-                text = item.dateTimeString,
+                text = dateLabel,
                 color = Color.White.copy(alpha = 0.7f),
                 style = MaterialTheme.typography.bodySmall,
                 fontSize = 12.sp,
                 textAlign = TextAlign.Center,
                 modifier = Modifier.fillMaxWidth()
             )
+            docLabel?.let {
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    text = it,
+                    color = Color.White.copy(alpha = 0.7f),
+                    style = MaterialTheme.typography.bodySmall,
+                    fontSize = 12.sp,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
         }
     }
 
