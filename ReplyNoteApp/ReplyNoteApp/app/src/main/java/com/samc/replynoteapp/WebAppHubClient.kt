@@ -14,13 +14,181 @@ import java.util.concurrent.TimeUnit
 
 object WebAppHubClient {
     private const val TAG = "WebAppHubClient"
-    private const val HUB_URL = "https://script.google.com/macros/s/AKfycbwfxRw3tfTi_qOtIGIPPREieLnB1KpT7GDXIaIefJfincg89kb-H8kTIbPRXfCoGyRKDg/exec"
+    const val CONFIG_URL = "https://script.google.com/macros/s/AKfycbybtpY6MlIg6pN8pMt8bNo9zwfRk4FciM6vAAdreb-4V20RweNQ6giIzPFXjrK5fhgOVQ/exec"
+    
+    // Cached hub URL and config
+    private var cachedHubUrl: String? = null
+    private var cachedMasterPassword: String? = null
+    private var lastConfigFetch: Long = 0
+    private const val CONFIG_CACHE_DURATION = 5 * 60 * 1000L // 5 minutes
     
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
         .build()
+    
+    // Fetch the current configuration from the config server with redirect support
+    suspend fun fetchConfig(context: Context): Result<Triple<String, String, String>> = withContext(Dispatchers.IO) {
+        try {
+            val currentTime = System.currentTimeMillis()
+            
+            // Return cached config if still valid
+            if (cachedHubUrl != null && cachedMasterPassword != null && 
+                (currentTime - lastConfigFetch) < CONFIG_CACHE_DURATION) {
+                return@withContext Result.success(Triple(cachedHubUrl!!, cachedMasterPassword!!, 
+                    SharedPreferencesHelper.loadConfigUrl(context) ?: CONFIG_URL))
+            }
+            
+            // Start with either user-configured URL or hardcoded default
+            var configUrl = SharedPreferencesHelper.loadConfigUrl(context) ?: CONFIG_URL
+            val visitedUrls = mutableSetOf<String>()
+            var hubUrl: String? = null
+            var masterPassword: String? = null
+            
+            // Follow redirect chain with loop detection
+            while (visitedUrls.size < 10) { // Max 10 redirects to prevent infinite loops
+                if (visitedUrls.contains(configUrl)) {
+                    Log.w(TAG, "Config redirect loop detected at $configUrl")
+                    break
+                }
+                visitedUrls.add(configUrl)
+                
+                val url = configUrl.toHttpUrl()
+                    .newBuilder()
+                    .addQueryParameter("action", "getConfig")
+                    .build()
+                
+                val request = Request.Builder()
+                    .url(url)
+                    .get()
+                    .build()
+                
+                val response = client.newCall(request).execute()
+                val responseBody = response.body?.string() ?: ""
+                
+                if (response.isSuccessful) {
+                    val json = JSONObject(responseBody)
+                    hubUrl = json.getString("hubUrl")
+                    masterPassword = json.getString("masterPassword")
+                    val nextConfigUrl = json.optString("nextConfigUrl", configUrl)
+                    
+                    if (nextConfigUrl != configUrl) {
+                        // Follow redirect
+                        Log.d(TAG, "Config redirect: $configUrl -> $nextConfigUrl")
+                        configUrl = nextConfigUrl
+                        continue
+                    } else {
+                        // No redirect, this is the final config
+                        break
+                    }
+                } else {
+                    Log.e(TAG, "Failed to fetch config from $configUrl: $responseBody")
+                    break
+                }
+            }
+            
+            if (hubUrl != null && masterPassword != null) {
+                // Update cache
+                cachedHubUrl = hubUrl
+                cachedMasterPassword = masterPassword
+                lastConfigFetch = currentTime
+                
+                // Save to SharedPreferences as fallback
+                SharedPreferencesHelper.saveHubUrl(context, hubUrl)
+                SharedPreferencesHelper.saveMasterPassword(context, masterPassword)
+                SharedPreferencesHelper.saveConfigUrl(context, configUrl)
+                
+                Log.d(TAG, "Config fetched successfully: hubUrl=$hubUrl, configUrl=$configUrl")
+                Result.success(Triple(hubUrl, masterPassword, configUrl))
+            } else {
+                // Fall back to SharedPreferences
+                val fallbackUrl = SharedPreferencesHelper.loadHubUrl(context) 
+                    ?: "https://script.google.com/macros/s/AKfycbwfxRw3tfTi_qOtIGIPPREieLnB1KpT7GDXIaIefJfincg89kb-H8kTIbPRXfCoGyRKDg/exec"
+                val fallbackPassword = SharedPreferencesHelper.loadMasterPassword(context) ?: "sam03"
+                val fallbackConfig = SharedPreferencesHelper.loadConfigUrl(context) ?: CONFIG_URL
+                Result.success(Triple(fallbackUrl, fallbackPassword, fallbackConfig))
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error fetching config", e)
+            // Fall back to SharedPreferences on network error
+            val fallbackUrl = SharedPreferencesHelper.loadHubUrl(context) 
+                ?: "https://script.google.com/macros/s/AKfycbwfxRw3tfTi_qOtIGIPPREieLnB1KpT7GDXIaIefJfincg89kb-H8kTIbPRXfCoGyRKDg/exec"
+            val fallbackPassword = SharedPreferencesHelper.loadMasterPassword(context) ?: "sam03"
+            val fallbackConfig = SharedPreferencesHelper.loadConfigUrl(context) ?: CONFIG_URL
+            Result.success(Triple(fallbackUrl, fallbackPassword, fallbackConfig))
+        }
+    }
+    
+    // Update the configuration on the config server
+    suspend fun updateConfig(context: Context, hubUrl: String? = null, masterPassword: String? = null, nextConfigUrl: String? = null): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            // Get current password for authentication
+            val currentPassword = cachedMasterPassword ?: SharedPreferencesHelper.loadMasterPassword(context) ?: "sam03"
+            
+            val json = JSONObject().apply {
+                hubUrl?.let { put("hubUrl", it) }
+                masterPassword?.let { put("masterPassword", it) }
+                nextConfigUrl?.let { put("nextConfigUrl", it) }
+            }
+            
+            // Use current config URL from preferences or default
+            val configUrl = SharedPreferencesHelper.loadConfigUrl(context) ?: CONFIG_URL
+            val url = configUrl.toHttpUrl()
+                .newBuilder()
+                .addQueryParameter("action", "setConfig")
+                .addQueryParameter("password", currentPassword)
+                .build()
+            
+            val body = json.toString().toRequestBody("application/json".toMediaType())
+            
+            val request = Request.Builder()
+                .url(url)
+                .post(body)
+                .build()
+            
+            val response = client.newCall(request).execute()
+            val responseBody = response.body?.string() ?: ""
+            
+            if (response.isSuccessful) {
+                // Update cache
+                hubUrl?.let { cachedHubUrl = it }
+                masterPassword?.let { cachedMasterPassword = it }
+                lastConfigFetch = System.currentTimeMillis()
+                
+                // Update SharedPreferences
+                hubUrl?.let { SharedPreferencesHelper.saveHubUrl(context, it) }
+                masterPassword?.let { SharedPreferencesHelper.saveMasterPassword(context, it) }
+                nextConfigUrl?.let { 
+                    if (it != configUrl) {
+                        // If changing config URL, save locally for next use
+                        SharedPreferencesHelper.saveConfigUrl(context, it)
+                    }
+                }
+                
+                Log.d(TAG, "Config updated successfully")
+                Result.success(Unit)
+            } else {
+                Log.e(TAG, "Failed to update config: $responseBody")
+                Result.failure(Exception("Failed to update config: $responseBody"))
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error updating config", e)
+            Result.failure(e)
+        }
+    }
+    
+    // Get the current hub URL (fetches if needed)
+    private suspend fun getHubUrl(context: Context): String {
+        val configResult = fetchConfig(context)
+        return if (configResult.isSuccess) {
+            configResult.getOrNull()?.first ?: SharedPreferencesHelper.loadHubUrl(context) 
+                ?: "https://script.google.com/macros/s/AKfycbwfxRw3tfTi_qOtIGIPPREieLnB1KpT7GDXIaIefJfincg89kb-H8kTIbPRXfCoGyRKDg/exec"
+        } else {
+            SharedPreferencesHelper.loadHubUrl(context) 
+                ?: "https://script.google.com/macros/s/AKfycbwfxRw3tfTi_qOtIGIPPREieLnB1KpT7GDXIaIefJfincg89kb-H8kTIbPRXfCoGyRKDg/exec"
+        }
+    }
     
     suspend fun registerDoc(
         context: Context,
@@ -29,8 +197,9 @@ object WebAppHubClient {
     ): Result<Unit> = withContext(Dispatchers.IO) {
         try {
             val token = SharedPreferencesHelper.loadHubUserToken(context)
+            val hubUrl = getHubUrl(context)
             
-            val url = HUB_URL.toHttpUrl()
+            val url = hubUrl.toHttpUrl()
                 .newBuilder()
                 .addQueryParameter("token", token)
                 .addQueryParameter("docId", docId)
@@ -71,13 +240,14 @@ object WebAppHubClient {
         try {
             // Use Hub URL for stats config (same as messaging)
             val token = SharedPreferencesHelper.loadHubUserToken(context)
+            val hubUrl = getHubUrl(context)
             Log.d(TAG, "=== STATS CONFIG START (HUB) ===")
-            Log.d(TAG, "Hub URL: $HUB_URL")
+            Log.d(TAG, "Hub URL: $hubUrl")
             Log.d(TAG, "DocId: $docId")
             Log.d(TAG, "Config - statsTop: ${config.statsTop}, statsBottom: ${config.statsBottom}")
             Log.d(TAG, "Hub token: ${if (token.isNullOrBlank()) "MISSING" else "present (${token.length} chars)"}")
             
-            val urlBuilder = HUB_URL.toHttpUrl()
+            val urlBuilder = hubUrl.toHttpUrl()
                 .newBuilder()
                 .addQueryParameter("token", token)
                 .addQueryParameter("docId", docId)
@@ -148,7 +318,8 @@ object WebAppHubClient {
         try {
             val token = SharedPreferencesHelper.loadHubUserToken(context)
             
-            val url = HUB_URL.toHttpUrl()
+            val hubUrl = getHubUrl(context)
+            val url = hubUrl.toHttpUrl()
                 .newBuilder()
                 .addQueryParameter("token", token)
                 .addQueryParameter("docId", docId)
@@ -186,7 +357,8 @@ object WebAppHubClient {
         try {
             val token = SharedPreferencesHelper.loadHubUserToken(context)
             
-            val url = HUB_URL.toHttpUrl()
+            val hubUrl = getHubUrl(context)
+            val url = hubUrl.toHttpUrl()
                 .newBuilder()
                 .addQueryParameter("token", token)
                 .addQueryParameter("docId", docId)
@@ -223,7 +395,8 @@ object WebAppHubClient {
         try {
             val token = SharedPreferencesHelper.loadHubUserToken(context)
             
-            val url = HUB_URL.toHttpUrl()
+            val hubUrl = getHubUrl(context)
+            val url = hubUrl.toHttpUrl()
                 .newBuilder()
                 .addQueryParameter("token", token)
                 .addQueryParameter("docId", docId)
@@ -251,11 +424,12 @@ object WebAppHubClient {
         }
     }
     
-    suspend fun testConnection(): Result<Boolean> = withContext(Dispatchers.IO) {
+    suspend fun testConnection(context: Context): Result<Boolean> = withContext(Dispatchers.IO) {
         try {
             // Simple GET request to check if the URL responds
+            val hubUrl = getHubUrl(context)
             val request = Request.Builder()
-                .url(HUB_URL)
+                .url(hubUrl)
                 .get()
                 .build()
             

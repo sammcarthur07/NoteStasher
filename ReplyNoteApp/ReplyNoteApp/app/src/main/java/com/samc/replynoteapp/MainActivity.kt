@@ -4,7 +4,9 @@ import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.BroadcastReceiver
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -38,10 +40,21 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.ui.res.painterResource
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.material3.*
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.runtime.*
+import androidx.compose.runtime.mutableIntStateOf
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.content.Context.VIBRATOR_SERVICE
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -68,6 +81,7 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.ui.focus.onFocusChanged
 import kotlin.math.abs
 import androidx.core.content.ContextCompat
+import androidx.core.app.NotificationManagerCompat
 import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -84,6 +98,7 @@ import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
 import com.samc.replynoteapp.HistoryAttachment
+import com.samc.replynoteapp.R
 // Ensure this line matches your project's theme file and new package structure
 import com.samc.replynoteapp.ui.theme.ReplyNoteAppTheme // <-- UPDATED PACKAGE FOR THEME
 
@@ -124,6 +139,7 @@ class MainActivity : ComponentActivity() {
                                 val entry = DocEntry(docId = docId, alias = alias)
                                 SharedPreferencesHelper.addDocEntry(this, entry, 3)
                                 SharedPreferencesHelper.saveSelectedDocId(this, docId)
+                                ensureDocNotification(this, entry)
                                 
                                 // Register with hub
                                 GlobalScope.launch {
@@ -187,19 +203,24 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startNotificationServiceConditionally() {
-        val googleDocUrlOrId = SharedPreferencesHelper.loadGoogleDocUrlOrId(this)
-        val appsScriptUrl = SharedPreferencesHelper.loadAppsScriptUrl(this)
+        // Check if any documents have notifications enabled
+        val docs = SharedPreferencesHelper.loadDocEntries(this)
+        val enabledDocs = docs.filter { doc ->
+            SharedPreferencesHelper.loadDocNotificationEnabled(this, doc.docId)
+        }
+        
+        if (enabledDocs.isEmpty()) {
+            Toast.makeText(this, "No documents selected for notifications. Please check at least one document.", Toast.LENGTH_LONG).show()
+            Log.w("MainActivity", "No documents have notifications enabled.")
+            return
+        }
+        val hasSyncedDoc = enabledDocs.any { !it.docId.startsWith("unsynced") }
+        if (!hasSyncedDoc) {
+            Toast.makeText(this, "Please sync at least one document before starting notifications.", Toast.LENGTH_LONG).show()
+            Log.w("MainActivity", "Notification start blocked - only unsynced docs enabled.")
+            return
+        }
 
-        if (googleDocUrlOrId.isNullOrBlank()) {
-            Toast.makeText(this, "Google Doc URL/ID not set. Please set it in Step 1.", Toast.LENGTH_LONG).show()
-            Log.w("MainActivity", "Google Doc URL/ID is not set in SharedPreferences.")
-            return
-        }
-        if (appsScriptUrl.isNullOrBlank()) {
-            Toast.makeText(this, "Apps Script URL not set. Please complete Step 3 after setting up your script.", Toast.LENGTH_LONG).show()
-            Log.w("MainActivity", "Apps Script URL is not set in SharedPreferences.")
-            return
-        }
         startActualNotificationService()
     }
 
@@ -620,7 +641,10 @@ private suspend fun sendCurrent(
             Toast.makeText(context, "Editor not ready", Toast.LENGTH_SHORT).show()
             return
         }
-        // Extract blocks JSON and HTML from WebView
+
+        // --- FIX: The logic has been restructured here ---
+
+        // 1. Always extract the HTML and JSON first.
         fun unescapeJsString(s: String?): String {
             if (s == null) return ""
             var r = s
@@ -644,6 +668,58 @@ private suspend fun sendCurrent(
             }
         }
         Log.d("SendCurrent", "Extracted html length=${html.length}, blocksJson length=${blocksJson.length}")
+
+        // 2. Now, decide which sending method to use based on the configuration.
+        val selectedDocId = SharedPreferencesHelper.loadSelectedDocId(context) ?: "unsynced_1"
+        val appsScriptUrl = SharedPreferencesHelper.loadAppsScriptUrl(context)
+        val isOnline = NetworkUtils.isNetworkAvailable(context)
+
+        // Path A: Use hub mode to send directly to the selected document
+        // Send HTML as plain text since hub endpoint doesn't support rich images
+        Log.d("SendCurrent", "Checking hub mode: docId='$selectedDocId' (len=${selectedDocId.length}), online=$isOnline, appsScriptUrl=${if(appsScriptUrl.isNullOrBlank()) "EMPTY" else "SET"}")
+        if (selectedDocId.length > 10 && isOnline && !selectedDocId.startsWith("unsynced")) {
+            Log.d("SendCurrent", "Using hub mode for Original Format (sending HTML to selected doc)")
+            
+            // Check if there are images - hub endpoint doesn't support them
+            val ajson = draftRepo.getDraftAttachmentsJson()
+            val hasImages = ajson.isNotBlank() && JSONArray(ajson).length() > 0
+            
+            if (hasImages) {
+                // Images present - warn user that images won't be sent via hub
+                Toast.makeText(
+                    context, 
+                    "Note: Images cannot be sent to multiple docs. Use Apps Script for image support.", 
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+            
+            // Build HTML without images (hub limitation)
+            val finalHtml = "-\n\n$html\n"
+            
+            // Send HTML as plain text to the document
+            val result = WebAppHubClient.appendPlain(context, selectedDocId, finalHtml)
+            withContext(Dispatchers.Main) {
+                result.onSuccess {
+                    Toast.makeText(context, "Message sent successfully!", Toast.LENGTH_SHORT).show()
+                    // Clear editor content
+                    richWebView.evaluateJavascript("window.__setContent(\"\")", null)
+                    // Clear attachments from draft
+                    draftRepo.clearDraft()
+                    draftRepo.saveDraftAttachmentsJson("[]")
+                    onPlainSuccess()
+                    // Save to history
+                    SharedPreferencesHelper.saveMessageToHistory(context, html)
+                    val preview = htmlToPlainSnippetLocal(html, 500).ifBlank { messageText.take(500) }
+                    SharedPreferencesHelper.saveDocLastMessage(context, selectedDocId, preview)
+                    refreshDocNotificationIfEnabled(context, selectedDocId)
+                }.onFailure { error ->
+                    Toast.makeText(context, "Failed to send: ${error.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+            return // Exit the function here for this path.
+        }
+
+        // Path B: Continue with the original RichSendService / Apps Script logic.
         try {
             val rootDbg = JSONObject(blocksJson)
             val arrDbg = rootDbg.optJSONArray("blocks") ?: JSONArray()
@@ -660,29 +736,19 @@ private suspend fun sendCurrent(
             }
             Log.d("SendCurrent", "Blocks summary: total=${arrDbg.length()} images=${img} paras=${para} headings=${head} listItems=${list} other=${other}")
         } catch (_: Exception) {}
-        // Merge attachments first
+
         val mergedBlocks = try {
             val root = JSONObject(blocksJson.ifBlank { "{\"format\":\"blocks_v1\",\"blocks\":[]}" })
             val arr = root.optJSONArray("blocks") ?: JSONArray()
             val resultArr = JSONArray()
-
-            // Ensure a dash line is inserted above, matching plain text behavior
             run {
-                val dashBlock = JSONObject()
-                    .put("type", "p")
-                    .put("text", "-")
+                val dashBlock = JSONObject().put("type", "p").put("text", "-")
                 resultArr.put(dashBlock)
             }
-
-            // Optional: add a blank line after the dash for spacing consistency
             run {
-                val blankBlock = JSONObject()
-                    .put("type", "p")
-                    .put("text", "")
+                val blankBlock = JSONObject().put("type", "p").put("text", "")
                 resultArr.put(blankBlock)
             }
-
-            // prepend attachments from draft if any
             val ajson = draftRepo.getDraftAttachmentsJson()
             if (ajson.isNotBlank()) {
                 val atts = JSONArray(ajson)
@@ -696,18 +762,11 @@ private suspend fun sendCurrent(
                     resultArr.put(o2)
                 }
             }
-
-            // original blocks content
             for (i in 0 until arr.length()) resultArr.put(arr.get(i))
-
-            // Optional trailing blank line for readability, mirroring plain text path
             run {
-                val trailingBlank = JSONObject()
-                    .put("type", "p")
-                    .put("text", "")
+                val trailingBlank = JSONObject().put("type", "p").put("text", "")
                 resultArr.put(trailingBlank)
             }
-
             val merged = JSONObject().put("format", "blocks_v1").put("blocks", resultArr).toString()
             try {
                 val arr2 = resultArr
@@ -723,76 +782,20 @@ private suspend fun sendCurrent(
             merged
         } catch (e: Exception) { blocksJson }
 
-        // Always use hub mode
-        val selectedDocId = SharedPreferencesHelper.loadSelectedDocId(context) ?: "unsynced_1"
-        
-        // Check network connectivity
-        val isOnline = NetworkUtils.isNetworkAvailable(context)
-        
         if (selectedDocId.startsWith("unsynced") || !isOnline) {
-            // Queue for later sync (offline or no doc configured)
-            val messageId = MessageQueueManager.addToQueue(context, selectedDocId, mergedBlocks, true)
-            
+            MessageQueueManager.addToQueue(context, selectedDocId, mergedBlocks, true, messageText.take(200))
             val reason = if (!isOnline) "offline - will sync when connected" else "no document URL configured"
             Toast.makeText(context, "Message queued ($reason)", Toast.LENGTH_LONG).show()
-            // Save to history with pending status
-            SharedPreferencesHelper.saveRichMessageToHistory(
-                context, 
-                html, 
-                messageText,
-                emptyList() // No attachments for queued messages yet
-            )
-            // Update the status to pending in history
+            SharedPreferencesHelper.saveRichMessageToHistory(context, html, messageText, emptyList())
             SharedPreferencesHelper.updateMessageHistoryStatus(context, 0, "pending")
+            val preview = htmlToPlainSnippetLocal(html, 200).ifBlank { messageText.take(200) }
+            SharedPreferencesHelper.saveDocLastMessage(context, selectedDocId, "Queued: $preview")
+            refreshDocNotificationIfEnabled(context, selectedDocId)
             onPlainSuccess()
             draftRepo.clearDraft()
             return
-        } else if (selectedDocId.length > 10 && isOnline) {
-            // Send via hub (has valid doc ID and online)
-            kotlinx.coroutines.GlobalScope.launch {
-                try {
-                    val chunks = mergedBlocks.chunked(60000) // 60KB chunks
-                    var success = true
-                    
-                    chunks.forEachIndexed { index, chunk ->
-                        if (success) {
-                            val chunkJson = if (chunks.size == 1) chunk else {
-                                // For multiple chunks, wrap each chunk
-                                JSONObject().put("format", "blocks_v1")
-                                    .put("blocks", JSONArray(chunk)).toString()
-                            }
-                            
-                            val result = WebAppHubClient.appendBlocks(
-                                context, selectedDocId, chunkJson
-                            )
-                            
-                            if (result.isFailure) {
-                                success = false
-                                withContext(Dispatchers.Main) {
-                                    Toast.makeText(context, "Failed to send: ${result.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
-                                }
-                            }
-                        }
-                    }
-                    
-                    if (success) {
-                        withContext(Dispatchers.Main) {
-                            Toast.makeText(context, "Message sent successfully!", Toast.LENGTH_SHORT).show()
-                            onPlainSuccess()
-                            draftRepo.clearDraft()
-                        }
-                    }
-                } catch (e: Exception) {
-                    withContext(Dispatchers.Main) {
-                        Toast.makeText(context, "Failed to send: ${e.message}", Toast.LENGTH_LONG).show()
-                    }
-                }
-            }
-            return
         }
-        
-        // Original foreground service method
-        // Persist to files and start foreground service
+
         val sessionId = java.util.UUID.randomUUID().toString()
         val dir = context.filesDir
         val jsonFile = java.io.File(dir, "send_$sessionId.json")
@@ -801,8 +804,6 @@ private suspend fun sendCurrent(
         htmlFile.writeText(html)
         Log.d("SendCurrent", "Session files written: json='${jsonFile.name}', html='${htmlFile.name}'")
         try {
-            // Save a sending state entry to history with preview
-            // Also store attachments thumbs for preview
             val attachList = mutableListOf<HistoryAttachment>()
             try {
                 val ajson = draftRepo.getDraftAttachmentsJson()
@@ -812,13 +813,11 @@ private suspend fun sendCurrent(
                         val o = atts.getJSONObject(i)
                         val dataUrl = o.optString("dataUrl")
                         val thumb = try { createPreviewThumbFromDataUrl(dataUrl) } catch (_: Exception) { dataUrl }
-                        // For history preview, keep only a small thumb to avoid OOM
                         attachList.add(HistoryAttachment(thumbDataUrl = thumb, dataUrl = null, mime = o.optString("mime")))
                     }
                 }
             } catch (_: Exception) {}
             SharedPreferencesHelper.saveSendingRichHistoryItem(context, sessionId, htmlPreview = html, attachments = attachList)
-            // Store lightweight attachments JSON (thumbs only) into session prefs for service to use BEFORE clearing
             try {
                 val ajson = draftRepo.getDraftAttachmentsJson()
                 if (ajson.isNotBlank()) {
@@ -836,51 +835,55 @@ private suspend fun sendCurrent(
                     context.getSharedPreferences("send_sessions", Context.MODE_PRIVATE).edit().putString("attachments_$sessionId", light.toString()).apply()
                 }
             } catch (_: Exception) {}
-            // Clear draft attachments after storing them for the service
             draftRepo.saveDraftAttachmentsJson("[]")
         } catch (_: Exception) {}
-        RichSendService.start(context, sessionId, jsonFile.absolutePath)
-        onBackgroundStarted(sessionId)
-        Toast.makeText(context, "Sending in background...", Toast.LENGTH_SHORT).show()
+
+        // This path is only reached if we're NOT using hub mode (i.e., for unsynced/offline cases)
+        // In the future, could support Apps Script URL for specific use cases
+        if (!appsScriptUrl.isNullOrBlank() && selectedDocId.startsWith("unsynced")) {
+            // Only use RichSendService for unsynced docs with Apps Script URL
+            RichSendService.start(context, sessionId, jsonFile.absolutePath)
+            onBackgroundStarted(sessionId)
+            Toast.makeText(context, "Sending in background...", Toast.LENGTH_SHORT).show()
+        } else {
+            // For offline/unsynced without Apps Script, message was already queued above
+            Log.d("SendCurrent", "Message queued for later sync")
+        }
     } else {
         // Plain text send - always use hub mode
         val selectedDocId = SharedPreferencesHelper.loadSelectedDocId(context) ?: "unsynced_1"
-        
-        // Check network connectivity
         val isOnline = NetworkUtils.isNetworkAvailable(context)
-        
+
         if (selectedDocId.startsWith("unsynced") || !isOnline) {
-            // Queue for later sync (offline or no doc configured)
-            MessageQueueManager.addToQueue(context, selectedDocId, messageText, false)
+            MessageQueueManager.addToQueue(context, selectedDocId, messageText, false, messageText.take(200))
             val reason = if (!isOnline) "offline - will sync when connected" else "no document URL configured"
             Toast.makeText(context, "Message queued ($reason)", Toast.LENGTH_LONG).show()
-            // Save to history with pending status
             SharedPreferencesHelper.saveMessageToHistory(context, messageText)
-            // Update the status to pending in history
             SharedPreferencesHelper.updateMessageHistoryStatus(context, 0, "pending")
+            SharedPreferencesHelper.saveDocLastMessage(context, selectedDocId, "Queued: ${messageText.take(200)}")
+            refreshDocNotificationIfEnabled(context, selectedDocId)
             onPlainSuccess()
             draftRepo.clearDraft()
             return
         } else if (selectedDocId.length > 10 && isOnline) {
-            // Send via hub (has valid doc ID and online)
-            kotlinx.coroutines.GlobalScope.launch {
-                val result = WebAppHubClient.appendPlain(context, selectedDocId, messageText)
-                withContext(Dispatchers.Main) {
-                    result.onSuccess {
-                        Toast.makeText(context, "Message sent successfully!", Toast.LENGTH_SHORT).show()
-                        // Save to history with sent status
-                        SharedPreferencesHelper.saveMessageToHistory(context, messageText)
-                        onPlainSuccess()
-                        draftRepo.clearDraft()
-                    }.onFailure { error ->
-                        Toast.makeText(context, "Failed to send: ${error.message}", Toast.LENGTH_LONG).show()
-                    }
+            val result = WebAppHubClient.appendPlain(context, selectedDocId, messageText)
+            withContext(Dispatchers.Main) {
+                result.onSuccess {
+                    Toast.makeText(context, "Message sent successfully!", Toast.LENGTH_SHORT).show()
+                    SharedPreferencesHelper.saveMessageToHistory(context, messageText)
+                    SharedPreferencesHelper.saveDocLastMessage(context, selectedDocId, messageText.take(500))
+                    refreshDocNotificationIfEnabled(context, selectedDocId)
+                    onPlainSuccess()
+                    draftRepo.clearDraft()
+                }.onFailure { error ->
+                    Toast.makeText(context, "Failed to send: ${error.message}", Toast.LENGTH_LONG).show()
                 }
             }
         } else {
-            // Queue locally for unsynced document
-            val messageId = MessageQueueManager.addToQueue(context, selectedDocId, messageText, false)
+            MessageQueueManager.addToQueue(context, selectedDocId, messageText, false, messageText.take(200))
             Toast.makeText(context, "Message saved locally (will sync when doc URL added)", Toast.LENGTH_LONG).show()
+            SharedPreferencesHelper.saveDocLastMessage(context, selectedDocId, "Queued: ${messageText.take(200)}")
+            refreshDocNotificationIfEnabled(context, selectedDocId)
             onPlainSuccess()
             draftRepo.clearDraft()
         }
@@ -932,6 +935,32 @@ fun extractDocIdFromUrl(urlOrId: String): String? {
     return null
 }
 
+private fun ensureDocNotification(context: Context, doc: DocEntry) {
+    val appContext = context.applicationContext
+    SharedPreferencesHelper.saveDocNotificationEnabled(appContext, doc.docId, true)
+    if (SharedPreferencesHelper.loadDocLastMessage(appContext, doc.docId).isNullOrBlank()) {
+        SharedPreferencesHelper.saveDocLastMessage(appContext, doc.docId, "Ready for new note...")
+    }
+    if (!doc.docId.startsWith("unsynced")) {
+        NotificationUtils.refreshDocumentNotification(appContext, doc.docId)
+        val hasPermission = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            ContextCompat.checkSelfPermission(appContext, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+        if (hasPermission) {
+            ContextCompat.startForegroundService(appContext, Intent(appContext, NotificationService::class.java))
+        } else {
+            Log.w("MainActivity", "Notification permission missing; service not started for ${doc.docId}")
+        }
+    }
+    appContext.sendBroadcast(Intent(NotificationReceiver.ACTION_NOTIFICATIONS_UPDATED))
+}
+
+private fun refreshDocNotificationIfEnabled(context: Context, docId: String) {
+    if (docId.startsWith("unsynced")) return
+    if (SharedPreferencesHelper.loadDocNotificationEnabled(context, docId)) {
+        NotificationUtils.refreshDocumentNotification(context, docId)
+    }
+}
+
 private fun decodeDataUrlToBitmap(dataUrl: String): Bitmap? {
     return try {
         val comma = dataUrl.indexOf(',')
@@ -962,14 +991,13 @@ fun AppWithTabs(
     context: Context
 ) {
     // Always use hub mode, ensure at least one doc exists
-    var docs by remember { 
-        mutableStateOf(
-            SharedPreferencesHelper.loadDocEntries(context).ifEmpty {
-                // This shouldn't happen as welcome screen creates one, but just in case
-                listOf(DocEntry(docId = "unsynced_1", alias = "Unsynced doc 1"))
-            }
-        )
+    var docs by remember {
+        val initialDocs = SharedPreferencesHelper.loadDocEntries(context).ifEmpty {
+            listOf(DocEntry(docId = "unsynced_1", alias = "Unsynced doc 1"))
+        }
+        mutableStateOf(initialDocs)
     }
+    var notificationsRevision by remember { mutableIntStateOf(0) }
     var selectedDocId by remember { 
         mutableStateOf(SharedPreferencesHelper.loadSelectedDocId(context) ?: docs.firstOrNull()?.docId ?: "unsynced_1") 
     }
@@ -988,7 +1016,61 @@ fun AppWithTabs(
     var showRemoveDialog by remember { mutableStateOf<String?>(null) }
     var showRenameDialog by remember { mutableStateOf<String?>(null) }
     
+    // Master tab states
+    var showMasterTab by remember { mutableStateOf(false) }
+    var showPasswordDialog by remember { mutableStateOf(false) }
+    var passwordInput by remember { mutableStateOf("") }
+    var showSuccessDialog by remember { mutableStateOf(false) }
+    
     val scope = rememberCoroutineScope()
+    DisposableEffect(context) {
+        val appContext = context.applicationContext
+        val filter = IntentFilter(NotificationReceiver.ACTION_NOTIFICATIONS_UPDATED)
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context?, intent: Intent?) {
+                docs = SharedPreferencesHelper.loadDocEntries(appContext)
+                val docIds = docs.map { it.docId }
+                if (selectedDocId !in docIds) {
+                    selectedDocId = docIds.firstOrNull() ?: "unsynced_1"
+                    SharedPreferencesHelper.saveSelectedDocId(appContext, selectedDocId)
+                }
+                notificationsRevision++
+            }
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            appContext.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            appContext.registerReceiver(receiver, filter)
+        }
+        val onChanged: () -> Unit = {
+            notificationsRevision++
+        }
+        NotificationStateNotifier.register(onChanged)
+        onChanged()
+        onDispose {
+            NotificationStateNotifier.unregister(onChanged)
+            try {
+                appContext.unregisterReceiver(receiver)
+            } catch (_: IllegalArgumentException) {
+            }
+        }
+    }
+    
+    // Fetch config on app startup and periodically
+    LaunchedEffect(Unit) {
+        scope.launch {
+            // Fetch initial config
+            WebAppHubClient.fetchConfig(context)
+            
+            // Set up periodic fetching every 5 minutes
+            while (true) {
+                delay(5 * 60 * 1000L) // 5 minutes
+                Log.d("MainActivity", "Fetching updated config from remote")
+                WebAppHubClient.fetchConfig(context)
+            }
+        }
+    }
     
     // Refresh history when tab changes or periodically
     LaunchedEffect(selectedTab) {
@@ -1049,7 +1131,7 @@ fun AppWithTabs(
                 }
                 
                 TabRow(
-                    selectedTabIndex = selectedTab,
+                    selectedTabIndex = if (showMasterTab && selectedTab == 3) 3 else selectedTab.coerceAtMost(2),
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Tab(
@@ -1097,6 +1179,18 @@ fun AppWithTabs(
                         },
                         text = { Text("Write") }
                     )
+                    
+                    // Master tab (only shows when unlocked)
+                    if (showMasterTab) {
+                        Tab(
+                            selected = selectedTab == 3,
+                            onClick = { 
+                                Log.d("MainActivity", "Master tab clicked")
+                                selectedTab = 3
+                            },
+                            text = { Text("Master") }
+                        )
+                    }
                 }
             }
         }
@@ -1108,10 +1202,19 @@ fun AppWithTabs(
             // Tab Content
             when (selectedTab) {
                 0 -> SetupScreen(
-                    onCheckPermissionAndStartService = onCheckPermissionAndStartService
+                    onCheckPermissionAndStartService = onCheckPermissionAndStartService,
+                    onShowMasterPassword = { showPasswordDialog = true },
+                    docsStateRevision = notificationsRevision,
+                    onRequestNotificationsRefresh = { notificationsRevision++ }
                 )
                 1 -> HistoryScreen(messageHistory = messageHistory)
                 2 -> WriteScreen(context = context)
+                3 -> if (showMasterTab) {
+                    MasterScreen(
+                        context = context,
+                        onSaveSuccess = { showSuccessDialog = true }
+                    )
+                }
             }
         }
     }
@@ -1130,6 +1233,8 @@ fun AppWithTabs(
                     docs = SharedPreferencesHelper.loadDocEntries(context)
                     selectedDocId = docId
                     SharedPreferencesHelper.saveSelectedDocId(context, docId)
+                    ensureDocNotification(context, entry)
+                    notificationsRevision++
                 } else {
                     Toast.makeText(context, "Could not add document (limit reached or duplicate)", Toast.LENGTH_SHORT).show()
                 }
@@ -1138,10 +1243,22 @@ fun AppWithTabs(
             onDelete = { docId ->
                 SharedPreferencesHelper.removeDocEntry(context, docId)
                 docs = SharedPreferencesHelper.loadDocEntries(context)
+                val appContext = context.applicationContext
+                NotificationManagerCompat.from(appContext).cancel(docId.hashCode())
                 if (selectedDocId == docId) {
                     selectedDocId = docs.firstOrNull()?.docId ?: "unsynced_1"
                     SharedPreferencesHelper.saveSelectedDocId(context, selectedDocId)
                 }
+                val anyEnabled = docs.any {
+                    !it.docId.startsWith("unsynced") &&
+                        SharedPreferencesHelper.loadDocNotificationEnabled(context, it.docId)
+                }
+                if (!anyEnabled) {
+                    appContext.stopService(Intent(appContext, NotificationService::class.java))
+                    NotificationManagerCompat.from(appContext).cancel(NotificationUtils.NOTIFICATION_ID)
+                }
+                appContext.sendBroadcast(Intent(NotificationReceiver.ACTION_NOTIFICATIONS_UPDATED))
+                notificationsRevision++
             },
             onUpdate = { oldDocId, newDocId ->
                 // Update unsynced doc with real Google Doc ID
@@ -1162,6 +1279,8 @@ fun AppWithTabs(
                     scope.launch {
                         MessageQueueManager.syncAllForDoc(context, newDocId)
                     }
+                    ensureDocNotification(context, updatedDoc)
+                    notificationsRevision++
                 }
             },
             onDismiss = { showAddDialog = false }
@@ -1179,10 +1298,22 @@ fun AppWithTabs(
                 }
                 SharedPreferencesHelper.removeDocEntry(context, docId)
                 docs = SharedPreferencesHelper.loadDocEntries(context)
+                val appContext = context.applicationContext
+                NotificationManagerCompat.from(appContext).cancel(docId.hashCode())
                 if (selectedDocId == docId) {
                     selectedDocId = docs.firstOrNull()?.docId ?: "unsynced_1"
                     SharedPreferencesHelper.saveSelectedDocId(context, selectedDocId)
                 }
+                val anyEnabled = docs.any {
+                    !it.docId.startsWith("unsynced") &&
+                        SharedPreferencesHelper.loadDocNotificationEnabled(context, it.docId)
+                }
+                if (!anyEnabled) {
+                    appContext.stopService(Intent(appContext, NotificationService::class.java))
+                    NotificationManagerCompat.from(appContext).cancel(NotificationUtils.NOTIFICATION_ID)
+                }
+                appContext.sendBroadcast(Intent(NotificationReceiver.ACTION_NOTIFICATIONS_UPDATED))
+                notificationsRevision++
                 showRemoveDialog = null
             },
             onDismiss = { showRemoveDialog = null }
@@ -1207,18 +1338,100 @@ fun AppWithTabs(
             onDismiss = { showRenameDialog = null }
         )
     }
+    
+    // Password dialog for Master tab access
+    if (showPasswordDialog) {
+        var checkingPassword by remember { mutableStateOf(false) }
+        
+        AlertDialog(
+            onDismissRequest = { 
+                showPasswordDialog = false
+                passwordInput = ""
+            },
+            title = { Text("Enter Password") },
+            text = {
+                OutlinedTextField(
+                    value = passwordInput,
+                    onValueChange = { passwordInput = it },
+                    label = { Text("Password") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !checkingPassword
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        checkingPassword = true
+                        scope.launch {
+                            // Fetch the current password from remote config
+                            val configResult = WebAppHubClient.fetchConfig(context)
+                            val masterPassword = if (configResult.isSuccess) {
+                                configResult.getOrNull()?.second ?: "sam03"
+                            } else {
+                                SharedPreferencesHelper.loadMasterPassword(context) ?: "sam03"
+                            }
+                            
+                            if (passwordInput == masterPassword) {
+                                showMasterTab = true
+                                selectedTab = 3
+                                showPasswordDialog = false
+                                passwordInput = ""
+                                Log.d("MainActivity", "Master tab unlocked")
+                            } else {
+                                Toast.makeText(context, "Incorrect password", Toast.LENGTH_SHORT).show()
+                                passwordInput = ""
+                            }
+                            checkingPassword = false
+                        }
+                    },
+                    enabled = !checkingPassword
+                ) {
+                    Text(if (checkingPassword) "Checking..." else "OK")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { 
+                        showPasswordDialog = false
+                        passwordInput = ""
+                    }
+                ) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+    
+    // Success dialog after saving script URL
+    if (showSuccessDialog) {
+        AlertDialog(
+            onDismissRequest = { showSuccessDialog = false },
+            title = { Text("Success") },
+            text = { Text("All changes have been saved successfully") },
+            confirmButton = {
+                TextButton(onClick = { showSuccessDialog = false }) {
+                    Text("OK")
+                }
+            }
+        )
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun SetupScreen(
-    onCheckPermissionAndStartService: () -> Unit
+    onCheckPermissionAndStartService: () -> Unit,
+    onShowMasterPassword: () -> Unit = {},
+    docsStateRevision: Int = 0,
+    onRequestNotificationsRefresh: () -> Unit = {}
 ) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     val focusManager = LocalFocusManager.current
-    val selectedDocId = SharedPreferencesHelper.loadSelectedDocId(context)
-    val docs = SharedPreferencesHelper.loadDocEntries(context)
+    val docs: List<DocEntry> = remember(docsStateRevision) { SharedPreferencesHelper.loadDocEntries(context) }
+    val selectedDocId: String? = remember(docsStateRevision) { SharedPreferencesHelper.loadSelectedDocId(context) }
     val selectedDoc = docs.find { it.docId == selectedDocId }
     
     // Reload stats when selected document changes
@@ -1269,9 +1482,10 @@ fun SetupScreen(
                         style = MaterialTheme.typography.bodyMedium
                     )
                     Text(
-                        "ID: ${selectedDoc.docId.take(20)}...",
+                        "ID: ${selectedDoc.docId}",
                         style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.fillMaxWidth()
                     )
                 } else {
                     Text(
@@ -1288,10 +1502,90 @@ fun SetupScreen(
         }
         Spacer(modifier = Modifier.height(24.dp))
 
-        // Notification Service
-        Button(onClick = onCheckPermissionAndStartService) {
+        // Notification Service button
+        Button(
+            onClick = onCheckPermissionAndStartService,
+            modifier = Modifier.fillMaxWidth()
+        ) {
             Text("Start Notification Service")
         }
+        
+        // Document notification checkboxes (only show if documents exist)
+        if (docs.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant
+                ),
+                shape = RoundedCornerShape(8.dp)
+            ) {
+                Column(
+                    modifier = Modifier.padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text(
+                        "Document Notifications",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    
+                    docs.forEach { doc ->
+                        val isChecked = SharedPreferencesHelper.loadDocNotificationEnabled(context, doc.docId)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Checkbox(
+                                checked = isChecked,
+                                onCheckedChange = { checked ->
+                                    SharedPreferencesHelper.saveDocNotificationEnabled(context, doc.docId, checked)
+                                    val appContext = context.applicationContext
+                                    
+                                    // Update notification state
+                                    if (checked) {
+                                        Log.d("SetupScreen", "Enabling notification for ${doc.alias}")
+                                        if (doc.docId.startsWith("unsynced")) {
+                                            Toast.makeText(context, "Sync this document before enabling notifications.", Toast.LENGTH_LONG).show()
+                                            SharedPreferencesHelper.saveDocNotificationEnabled(context, doc.docId, false)
+                                            appContext.sendBroadcast(Intent(NotificationReceiver.ACTION_NOTIFICATIONS_UPDATED))
+                                            onRequestNotificationsRefresh()
+                                        } else {
+                                            ensureDocNotification(appContext, doc)
+                                            onRequestNotificationsRefresh()
+                                        }
+                                    } else {
+                                        Log.d("SetupScreen", "Disabling notification for ${doc.alias}")
+                                        NotificationManagerCompat.from(appContext).cancel(doc.docId.hashCode())
+                                        val remainingEnabled = docs.any { other ->
+                                            other.docId != doc.docId &&
+                                                !other.docId.startsWith("unsynced") &&
+                                                SharedPreferencesHelper.loadDocNotificationEnabled(context, other.docId)
+                                        }
+                                        if (!remainingEnabled) {
+                                            appContext.stopService(Intent(appContext, NotificationService::class.java))
+                                            NotificationManagerCompat.from(appContext).cancel(NotificationUtils.NOTIFICATION_ID)
+                                        } else {
+                                            ContextCompat.startForegroundService(appContext, Intent(appContext, NotificationService::class.java))
+                                        }
+                                        appContext.sendBroadcast(Intent(NotificationReceiver.ACTION_NOTIFICATIONS_UPDATED))
+                                        onRequestNotificationsRefresh()
+                                    }
+                                }
+                            )
+                            Text(
+                                text = doc.alias,
+                                modifier = Modifier.padding(start = 8.dp),
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        
         Spacer(modifier = Modifier.height(24.dp))
     Spacer(modifier = Modifier.height(24.dp))
     Text("STATS", style = MaterialTheme.typography.titleMedium)
@@ -1620,10 +1914,282 @@ fun SetupScreen(
                 }
             }
         }
+        
+        // Hidden image button for Master tab access
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 16.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            val vibrator = remember { context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator }
+            var isHolding by remember { mutableStateOf(false) }
+            var holdJob by remember { mutableStateOf<Job?>(null) }
+            
+            Image(
+                painter = painterResource(id = R.drawable.app_icon_bottom),
+                contentDescription = null, // Hidden button, no description needed
+                modifier = Modifier
+                    .pointerInput(Unit) {
+                        awaitEachGesture {
+                            val down = awaitFirstDown()
+                            isHolding = true
+                            
+                            // Use the scope from SetupScreen to launch coroutine
+                            holdJob = scope.launch {
+                                delay(3000) // 3 seconds
+                                if (isHolding) {
+                                    // Vibrate to indicate success
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                        vibrator.vibrate(VibrationEffect.createOneShot(100, VibrationEffect.DEFAULT_AMPLITUDE))
+                                    } else {
+                                        @Suppress("DEPRECATION")
+                                        vibrator.vibrate(100)
+                                    }
+                                    onShowMasterPassword()
+                                }
+                            }
+                            
+                            // Wait for release or cancellation
+                            waitForUpOrCancellation()
+                            isHolding = false
+                            holdJob?.cancel()
+                            holdJob = null
+                        }
+                    }
+            )
+        }
         }
     }
     }
     // Removed Apply/Install buttons; all actions are automatic via checkboxes and fields above
+}
+
+@Composable
+fun MasterScreen(context: Context, onSaveSuccess: () -> Unit) {
+    var hubUrl by remember { mutableStateOf("") }
+    var configUrl by remember { mutableStateOf("") }
+    var isLoading by remember { mutableStateOf(true) }
+    var networkError by remember { mutableStateOf(false) }
+    var hubUrlError by remember { mutableStateOf(false) }
+    var configUrlError by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    
+    // Fetch config on load
+    LaunchedEffect(Unit) {
+        scope.launch {
+            val result = WebAppHubClient.fetchConfig(context)
+            if (result.isSuccess) {
+                val (hub, _, config) = result.getOrNull() ?: Triple("", "", "")
+                hubUrl = hub
+                configUrl = config
+                networkError = false
+            } else {
+                // Use local fallback
+                hubUrl = SharedPreferencesHelper.loadHubUrl(context) ?: ""
+                configUrl = SharedPreferencesHelper.loadConfigUrl(context) ?: WebAppHubClient.CONFIG_URL
+                networkError = true
+            }
+            isLoading = false
+        }
+    }
+    
+    // Validate URL format
+    fun isValidScriptUrl(url: String): Boolean {
+        return url.isBlank() || 
+               (url.startsWith("https://script.google.com/") && 
+                url.contains("/exec"))
+    }
+    
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp)
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        Text(
+            "Master Configuration",
+            style = MaterialTheme.typography.headlineMedium,
+            modifier = Modifier.padding(bottom = 8.dp)
+        )
+        
+        // Config Server URL Field
+        Text(
+            "Config Server URL",
+            style = MaterialTheme.typography.labelLarge,
+            modifier = Modifier.padding(bottom = 4.dp)
+        )
+        
+        OutlinedTextField(
+            value = configUrl,
+            onValueChange = { 
+                configUrl = it
+                configUrlError = !isValidScriptUrl(it)
+            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .border(
+                    width = 1.dp,
+                    color = when {
+                        networkError -> Color(0xFFFFA500)
+                        configUrlError -> Color(0xFFFFA500)
+                        else -> Color(0xFF98FB98)
+                    },
+                    shape = RoundedCornerShape(8.dp)
+                ),
+            placeholder = { Text("Config script URL (controls all devices)") },
+            singleLine = false,
+            isError = configUrlError,
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = when {
+                    networkError || configUrlError -> Color(0xFFFFA500)
+                    else -> Color(0xFF98FB98)
+                },
+                unfocusedBorderColor = when {
+                    networkError || configUrlError -> Color(0xFFFFA500)
+                    else -> Color(0xFF98FB98)
+                },
+                errorBorderColor = Color(0xFFFFA500),
+                focusedContainerColor = Color.Transparent,
+                unfocusedContainerColor = Color.Transparent,
+                errorContainerColor = Color.Transparent
+            ),
+            shape = RoundedCornerShape(8.dp),
+            supportingText = {
+                when {
+                    configUrlError -> Text(
+                        "URL must start with https://script.google.com/ and contain /exec",
+                        color = Color(0xFFFFA500)
+                    )
+                }
+            },
+            enabled = !isLoading
+        )
+        
+        Spacer(modifier = Modifier.height(8.dp))
+        
+        // Hub Script URL Field
+        Text(
+            "Hub Script URL",
+            style = MaterialTheme.typography.labelLarge,
+            modifier = Modifier.padding(bottom = 4.dp)
+        )
+        
+        OutlinedTextField(
+            value = hubUrl,
+            onValueChange = { 
+                hubUrl = it
+                hubUrlError = !isValidScriptUrl(it)
+            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .border(
+                    width = 1.dp,
+                    color = when {
+                        networkError -> Color(0xFFFFA500)
+                        hubUrlError -> Color(0xFFFFA500)
+                        else -> Color(0xFF98FB98)
+                    },
+                    shape = RoundedCornerShape(8.dp)
+                ),
+            placeholder = { Text("Hub script URL (handles document operations)") },
+            singleLine = false,
+            isError = hubUrlError,
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = when {
+                    networkError || hubUrlError -> Color(0xFFFFA500)
+                    else -> Color(0xFF98FB98)
+                },
+                unfocusedBorderColor = when {
+                    networkError || hubUrlError -> Color(0xFFFFA500)
+                    else -> Color(0xFF98FB98)
+                },
+                errorBorderColor = Color(0xFFFFA500),
+                focusedContainerColor = Color.Transparent,
+                unfocusedContainerColor = Color.Transparent,
+                errorContainerColor = Color.Transparent
+            ),
+            shape = RoundedCornerShape(8.dp),
+            supportingText = {
+                when {
+                    networkError -> Text(
+                        "Network error - using cached configuration",
+                        color = Color(0xFFFFA500)
+                    )
+                    hubUrlError -> Text(
+                        "URL must start with https://script.google.com/ and contain /exec",
+                        color = Color(0xFFFFA500)
+                    )
+                }
+            },
+            enabled = !isLoading
+        )
+        
+        Text(
+            "Config Server URL: Controls which hub all devices use (change this to redirect all users)\n" +
+            "Hub Script URL: The actual script that handles document operations",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(vertical = 8.dp)
+        )
+        
+        Button(
+            onClick = {
+                if (!hubUrlError && !configUrlError) {
+                    scope.launch {
+                        networkError = false
+                        
+                        // First, save the config URL locally
+                        SharedPreferencesHelper.saveConfigUrl(context, configUrl)
+                        
+                        // Get current password
+                        val configResult = WebAppHubClient.fetchConfig(context)
+                        val currentPassword = configResult.getOrNull()?.second ?: "sam03"
+                        
+                        // Update current config to point to new config (if changed)
+                        if (configUrl != (configResult.getOrNull()?.third ?: WebAppHubClient.CONFIG_URL)) {
+                            // Update old config to redirect to new config
+                            val updateRedirect = WebAppHubClient.updateConfig(
+                                context, 
+                                nextConfigUrl = configUrl
+                            )
+                            if (updateRedirect.isFailure) {
+                                Log.e("MasterScreen", "Failed to update redirect: ${updateRedirect.exceptionOrNull()}")
+                            }
+                        }
+                        
+                        // Update the hub URL at the current config
+                        val result = WebAppHubClient.updateConfig(context, hubUrl = hubUrl)
+                        if (result.isSuccess) {
+                            Log.d("MasterScreen", "Saved configuration successfully")
+                            onSaveSuccess()
+                            networkError = false
+                        } else {
+                            Toast.makeText(context, "Failed to update config: ${result.exceptionOrNull()?.message}", Toast.LENGTH_LONG).show()
+                            networkError = true
+                        }
+                    }
+                } else {
+                    Toast.makeText(context, "Please fix URL errors before saving", Toast.LENGTH_SHORT).show()
+                }
+            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(48.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (hubUrlError || configUrlError) Color.Gray else Color(0xFF98FB98),
+                contentColor = Color.Black
+            ),
+            enabled = !hubUrlError && !configUrlError && !isLoading,
+            shape = RoundedCornerShape(8.dp)
+        ) {
+            Text(
+                "Save",
+                fontWeight = FontWeight.Bold
+            )
+        }
+    }
 }
 
 @Composable
@@ -2202,12 +2768,13 @@ fun WriteScreen(context: Context) {
             }
 
             // Attach Image button should NOT appear under the text input when keyboard is up
-            if (keyboardHeight <= 0) {
-                Log.d("WriteScreen", "Show Attach Image button (keyboard hidden)")
-                TextButton(onClick = { pickImages.launch(arrayOf("image/*")) }) { Text("Attach Image") }
-            } else {
-                Log.d("WriteScreen", "Hide Attach Image button (keyboard visible)")
-            }
+            // Temporarily disabled image attachment feature
+            // if (keyboardHeight <= 0) {
+            //     Log.d("WriteScreen", "Show Attach Image button (keyboard hidden)")
+            //     TextButton(onClick = { pickImages.launch(arrayOf("image/*")) }) { Text("Attach Image") }
+            // } else {
+            //     Log.d("WriteScreen", "Hide Attach Image button (keyboard visible)")
+            // }
         } else {
             // Large Text Input Field
             OutlinedTextField(
@@ -2332,9 +2899,10 @@ fun WriteScreen(context: Context) {
         Button(
             onClick = {
                 if (!isSending) {
+                    Log.d("SendButton", "Send clicked - setting isSending=true immediately")
+                    isSending = true
                     focusManager.clearFocus()
                     if (selectedFont == "Original Format") {
-                        isSending = true
                         showSendDialog = true
                         sendDialogPhase = "preparing"
                         sendDialogSessionId = null
@@ -2343,7 +2911,7 @@ fun WriteScreen(context: Context) {
                         sendDialogError = null
                     }
                     scope.launch {
-                        isSending = true
+                        Log.d("SendButton", "Coroutine started - calling sendCurrent")
                         sendCurrent(
                             context = context,
                             selectedFont = selectedFont,
@@ -2353,6 +2921,11 @@ fun WriteScreen(context: Context) {
                             onPlainSuccess = {
                                 // Clear UI state on plain success
                                 messageText = ""
+                                // For Original Format, also clear rich content and attachments
+                                if (selectedFont == "Original Format") {
+                                    richHtml = ""
+                                    attachments = emptyList()
+                                }
                             },
                             onBackgroundStarted = { sid ->
                                 // Clear editor + draft and switch to uploading phase
@@ -2364,10 +2937,10 @@ fun WriteScreen(context: Context) {
                                 sendDialogPhase = "uploading"
                             }
                         )
-                        if (selectedFont != "Original Format") {
-                            // Plain path: sending finished now
-                            isSending = false
-                        }
+                        // Always set isSending=false after sendCurrent completes
+                        // Hub mode is now used for Original Format, so we always reset here
+                        Log.d("SendButton", "Send complete - setting isSending=false")
+                        isSending = false
                     }
                 }
             },
@@ -2400,9 +2973,10 @@ fun WriteScreen(context: Context) {
             Button(
                 onClick = {
                     if (!isSending) {
+                        Log.d("SendButton", "Floating send clicked - setting isSending=true immediately")
+                        isSending = true
                         // Keep focus so keyboard stays open for continued typing
                         if (selectedFont == "Original Format") {
-                            isSending = true
                             showSendDialog = true
                             sendDialogPhase = "preparing"
                             sendDialogSessionId = null
@@ -2411,7 +2985,7 @@ fun WriteScreen(context: Context) {
                             sendDialogError = null
                         }
                         scope.launch {
-                            isSending = true
+                            Log.d("SendButton", "Floating coroutine started - calling sendCurrent")
                             sendCurrent(
                                 context = context,
                                 selectedFont = selectedFont,
@@ -2420,6 +2994,11 @@ fun WriteScreen(context: Context) {
                                 draftRepo = draftRepo,
                                 onPlainSuccess = {
                                     messageText = ""
+                                    // For Original Format, also clear rich content and attachments
+                                    if (selectedFont == "Original Format") {
+                                        richHtml = ""
+                                        attachments = emptyList()
+                                    }
                                 },
                                 onBackgroundStarted = { sid ->
                                     richHtml = ""
@@ -2430,9 +3009,10 @@ fun WriteScreen(context: Context) {
                                     sendDialogPhase = "uploading"
                                 }
                             )
-                            if (selectedFont != "Original Format") {
-                                isSending = false
-                            }
+                            // Always set isSending=false after sendCurrent completes
+                            // Hub mode is now used for Original Format, so we always reset here
+                            Log.d("SendButton", "Floating send complete - setting isSending=false")
+                            isSending = false
                         }
                     }
                 },

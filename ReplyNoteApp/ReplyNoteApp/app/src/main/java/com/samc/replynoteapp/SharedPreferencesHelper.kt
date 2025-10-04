@@ -39,6 +39,8 @@ object SharedPreferencesHelper {
     private const val KEY_STATS_TOP = "stats_top"
     private const val KEY_STATS_BOTTOM = "stats_bottom"
     private const val KEY_STATS_ANYWHERE = "stats_anywhere"
+    private const val KEY_DOC_LAST_MESSAGE_PREFIX = "doc_last_message_"
+    private const val KEY_DOC_LAST_UPDATED_PREFIX = "doc_last_updated_"
     // In-App Script Hub (Option 5) keys
     private const val KEY_USE_IN_APP_SCRIPT = "use_in_app_script"
     private const val KEY_HUB_WEB_APP_URL = "hub_web_app_url"
@@ -61,6 +63,69 @@ object SharedPreferencesHelper {
         val url = getPrefs(context).getString(KEY_APPS_SCRIPT_URL, null)
         Log.d("PrefsHelper", "Loaded Apps Script URL: $url")
         return url
+    }
+    
+    fun saveHubUrl(context: Context, url: String) {
+        getPrefs(context).edit().putString("hub_url", url).apply()
+        Log.d("PrefsHelper", "Saved Hub URL: $url")
+    }
+    
+    fun loadHubUrl(context: Context): String? {
+        val url = getPrefs(context).getString("hub_url", null)
+        Log.d("PrefsHelper", "Loaded Hub URL: $url")
+        return url
+    }
+    
+    fun saveMasterPassword(context: Context, password: String) {
+        getPrefs(context).edit().putString("master_password", password).apply()
+        Log.d("PrefsHelper", "Saved Master Password")
+    }
+    
+    fun loadMasterPassword(context: Context): String? {
+        return getPrefs(context).getString("master_password", null)
+    }
+    
+    fun saveConfigUrl(context: Context, url: String) {
+        getPrefs(context).edit().putString("config_url", url).apply()
+        Log.d("PrefsHelper", "Saved Config URL: $url")
+    }
+    
+    fun loadConfigUrl(context: Context): String? {
+        val url = getPrefs(context).getString("config_url", null)
+        Log.d("PrefsHelper", "Loaded Config URL: $url")
+        return url
+    }
+    
+    fun saveDocNotificationEnabled(context: Context, docId: String, enabled: Boolean) {
+        getPrefs(context).edit().putBoolean("notification_$docId", enabled).apply()
+        Log.d("PrefsHelper", "Saved notification state for $docId: $enabled")
+    }
+    
+    fun loadDocNotificationEnabled(context: Context, docId: String): Boolean {
+        // Default to true (checked) for new documents
+        return getPrefs(context).getBoolean("notification_$docId", true)
+    }
+
+    fun saveDocLastMessage(context: Context, docId: String, message: String, timestamp: Long = System.currentTimeMillis()) {
+        getPrefs(context).edit()
+            .putString(KEY_DOC_LAST_MESSAGE_PREFIX + docId, message)
+            .putLong(KEY_DOC_LAST_UPDATED_PREFIX + docId, timestamp)
+            .apply()
+    }
+
+    fun loadDocLastMessage(context: Context, docId: String): String? {
+        return getPrefs(context).getString(KEY_DOC_LAST_MESSAGE_PREFIX + docId, null)
+    }
+
+    fun loadDocLastUpdated(context: Context, docId: String): Long {
+        return getPrefs(context).getLong(KEY_DOC_LAST_UPDATED_PREFIX + docId, 0L)
+    }
+
+    fun clearDocLastMessage(context: Context, docId: String) {
+        getPrefs(context).edit()
+            .remove(KEY_DOC_LAST_MESSAGE_PREFIX + docId)
+            .remove(KEY_DOC_LAST_UPDATED_PREFIX + docId)
+            .apply()
     }
 
     // New function to save Google Doc URL/ID
@@ -427,6 +492,7 @@ object SharedPreferencesHelper {
         val list = loadDocEntries(context)
         val newList = list.filterNot { it.docId == docId }
         saveDocEntries(context, newList)
+        clearDocLastMessage(context, docId)
         val sel = loadSelectedDocId(context)
         if (sel == docId) saveSelectedDocId(context, newList.firstOrNull()?.docId)
     }

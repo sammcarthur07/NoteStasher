@@ -10,107 +10,138 @@ import androidx.core.app.RemoteInput
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import okhttp3.*
-import okhttp3.MediaType.Companion.toMediaTypeOrNull
-import okhttp3.RequestBody.Companion.toRequestBody
-import java.io.IOException
+import kotlinx.coroutines.withContext
 
 class NotificationReceiver : BroadcastReceiver() {
 
+    companion object {
+        const val ACTION_DISABLE_ALL = "com.samc.replynoteapp.ACTION_DISABLE_ALL"
+        const val ACTION_NOTIFICATIONS_UPDATED = "com.samc.replynoteapp.ACTION_NOTIFICATIONS_UPDATED"
+    }
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val okHttpClient = OkHttpClient()
+    private val retryDelays = listOf(0L, 5_000L, 10_000L, 15_000L, 30_000L)
 
     override fun onReceive(context: Context?, intent: Intent?) {
+        if (context == null || intent == null) {
+            return
+        }
+        val appContext = context.applicationContext
+        val action = intent.action
+
+        if (action == ACTION_DISABLE_ALL) {
+            disableAllNotifications(appContext)
+            return
+        }
+
         Log.d("NotificationReceiver", "=== onReceive called ===")
-        Log.d("NotificationReceiver", "Context: ${context != null}, Intent: ${intent != null}, Action: ${intent?.action}")
+        Log.d("NotificationReceiver", "Context: true, Intent: true, Action: ${intent.action}")
         
-        if (context == null || intent == null || intent.action != NotificationUtils.ACTION_REPLY) {
-            Log.w("NotificationReceiver", "Invalid context, intent, or action. Expected action: ${NotificationUtils.ACTION_REPLY}")
+        if (action != NotificationUtils.ACTION_REPLY) {
+            Log.w("NotificationReceiver", "Unexpected action: ${intent.action}")
             return
         }
 
         val remoteInput = RemoteInput.getResultsFromIntent(intent)
         val replyText = remoteInput?.getCharSequence(NotificationUtils.KEY_TEXT_REPLY)?.toString()
-        Log.d("NotificationReceiver", "Reply Received: '$replyText' (length: ${replyText?.length ?: 0})")
+        val docId = intent.getStringExtra(NotificationUtils.EXTRA_DOC_ID)
+        Log.d("NotificationReceiver", "Reply Received: '$replyText' (length: ${replyText?.length ?: 0}) for docId=$docId")
 
         val pendingResult = goAsync()
-        val appContext = context.applicationContext
-        val appsScriptUrl = SharedPreferencesHelper.loadAppsScriptUrl(appContext)
-
-        if (appsScriptUrl.isNullOrBlank()) {
-            Log.e("NotificationReceiver", "Apps Script URL not configured in app settings.")
-            Toast.makeText(appContext, "Error: Apps Script URL not set. Configure in app.", Toast.LENGTH_LONG).show()
-            refreshNotification(appContext, "URL Not Set! Configure in app.")
+        if (replyText.isNullOrBlank()) {
+            Log.w("NotificationReceiver", "Empty reply text, only refreshing notification.")
+            docId?.let { refreshDocNotificationIfEnabled(appContext, it) }
             pendingResult.finish()
             return
         }
 
-        if (!replyText.isNullOrEmpty()) {
-            scope.launch {
-                var success = false
-                var statusMessage = "Failed to send note"
-                try {
-                    Log.d("NotificationReceiver", "Attempting to send text to Google Doc...")
-                    sendTextToGoogleDoc(replyText, appsScriptUrl)
-                    Log.d("NotificationReceiver", "Successfully sent '$replyText' to Apps Script: $appsScriptUrl")
+        if (docId.isNullOrBlank()) {
+            Log.e("NotificationReceiver", "Missing docId in reply intent")
+            Toast.makeText(appContext, "Unable to send: missing document info", Toast.LENGTH_LONG).show()
+            pendingResult.finish()
+            return
+        }
+
+        scope.launch {
+            val docEntries = SharedPreferencesHelper.loadDocEntries(appContext)
+            val doc = docEntries.firstOrNull { it.docId == docId }
+
+            if (doc == null || doc.docId.startsWith("unsynced")) {
+                Log.w("NotificationReceiver", "Doc $docId is unsynced or missing; queueing reply")
+                handleQueueFallback(appContext, docId, replyText, "Document not synced")
+                pendingResult.finish()
+                return@launch
+            }
+
+            var success = false
+            var lastError: String? = null
+
+            for (delayMs in retryDelays) {
+                if (delayMs > 0) delay(delayMs)
+                val result = WebAppHubClient.appendPlain(appContext, docId, replyText)
+                if (result.isSuccess) {
                     success = true
-                    statusMessage = "Sent: $replyText"
-                    // Save to history on successful send
-                    Log.d("NotificationReceiver", "Saving message to history...")
-                    SharedPreferencesHelper.saveMessageToHistory(appContext, replyText)
-                    Log.d("NotificationReceiver", "Message saved to history successfully")
-                } catch (e: IOException) {
-                    Log.e("NotificationReceiver", "Network error sending to Apps Script", e)
-                    statusMessage = "Network Error"
-                } catch (e: Exception) {
-                    Log.e("NotificationReceiver", "Error sending to Apps Script", e)
-                    statusMessage = "Send Error"
-                } finally {
-                    refreshNotification(appContext, statusMessage)
-                    pendingResult.finish()
-                    Log.d("NotificationReceiver", "goAsync finished.")
+                    break
+                } else {
+                    lastError = result.exceptionOrNull()?.message ?: "Unknown error"
+                    Log.w("NotificationReceiver", "Retry after failure for doc $docId: $lastError")
                 }
             }
-        } else {
-            Log.w("NotificationReceiver", "Empty reply text, only refreshing notification.")
-            refreshNotification(appContext, "Ready for new note...")
-            pendingResult.finish()
-        }
-    }
 
-    private fun refreshNotification(context: Context, newContentText: String) {
-        try {
-            val notificationManager = NotificationManagerCompat.from(context)
-            val newNotification = NotificationUtils.buildNotification(context, newContentText)
-            notificationManager.notify(NotificationUtils.NOTIFICATION_ID, newNotification)
-            Log.d("NotificationReceiver", "Notification refreshed with text: $newContentText")
-        } catch (e: SecurityException) {
-            Log.e("NotificationReceiver", "Permission error refreshing notification", e)
-        } catch (e: Exception) {
-            Log.e("NotificationReceiver", "General error refreshing notification", e)
-        }
-    }
-
-    @Throws(IOException::class)
-    private fun sendTextToGoogleDoc(text: String, url: String) {
-        Log.d("NotificationReceiver", "sendTextToGoogleDoc: Preparing request...")
-        val requestBody = text.toRequestBody("text/plain; charset=utf-8".toMediaTypeOrNull())
-        val request = Request.Builder()
-            .url(url)
-            .post(requestBody)
-            .build()
-
-        Log.d("NotificationReceiver", "sendTextToGoogleDoc: Executing HTTP request...")
-        okHttpClient.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) {
-                val responseBodyStr = response.body?.string() ?: "No response body"
-                Log.e("NotificationReceiver", "Apps Script POST failed: ${response.code} ${response.message}\nBody: $responseBodyStr")
-                throw IOException("Unexpected code ${response.code} - $responseBodyStr")
+            if (success) {
+                SharedPreferencesHelper.saveDocLastMessage(appContext, docId, replyText)
+                SharedPreferencesHelper.saveMessageToHistory(appContext, replyText)
+                updateHistoryStatus(appContext, "sent")
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(appContext, "Sent to ${doc.alias.ifBlank { doc.title }}", Toast.LENGTH_SHORT).show()
+                }
+                refreshDocNotificationIfEnabled(appContext, docId)
             } else {
-                val responseBodyStr = response.body?.string() ?: "No response body"
-                Log.d("NotificationReceiver", "Apps Script POST successful: $responseBodyStr")
+                val errorText = lastError ?: "Send failed"
+                SharedPreferencesHelper.saveDocLastMessage(appContext, docId, "Retry scheduled: $errorText")
+                SharedPreferencesHelper.saveMessageToHistory(appContext, replyText)
+                updateHistoryStatus(appContext, "pending")
+                handleQueueFallback(appContext, docId, replyText, errorText)
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(appContext, "Send failed, will retry", Toast.LENGTH_LONG).show()
+                }
+                refreshDocNotificationIfEnabled(appContext, docId)
             }
+
+            pendingResult.finish()
+            Log.d("NotificationReceiver", "goAsync finished.")
+        }
+    }
+
+    private suspend fun handleQueueFallback(context: Context, docId: String, replyText: String, errorText: String) {
+        val messageId = MessageQueueManager.addToQueue(context, docId, replyText, false, replyText.take(200))
+        MessageRetryScheduler.enqueue(context)
+        Log.d("NotificationReceiver", "Queued message $messageId for doc $docId after error: $errorText")
+    }
+
+    private fun updateHistoryStatus(context: Context, status: String) {
+        SharedPreferencesHelper.updateMessageHistoryStatus(context, 0, status)
+    }
+
+    private fun disableAllNotifications(context: Context) {
+        val docs = SharedPreferencesHelper.loadDocEntries(context)
+        docs.forEach { doc ->
+            SharedPreferencesHelper.saveDocNotificationEnabled(context, doc.docId, false)
+            NotificationManagerCompat.from(context).cancel(doc.docId.hashCode())
+        }
+        NotificationManagerCompat.from(context).cancel(NotificationUtils.NOTIFICATION_ID)
+        context.stopService(Intent(context, NotificationService::class.java))
+        context.sendBroadcast(Intent(ACTION_NOTIFICATIONS_UPDATED))
+        NotificationStateNotifier.notifyChanged()
+        Log.d("NotificationReceiver", "All document notifications disabled via notification action")
+    }
+
+    private fun refreshDocNotificationIfEnabled(context: Context, docId: String) {
+        if (docId.startsWith("unsynced")) return
+        if (SharedPreferencesHelper.loadDocNotificationEnabled(context, docId)) {
+            NotificationUtils.refreshDocumentNotification(context, docId)
         }
     }
 }
