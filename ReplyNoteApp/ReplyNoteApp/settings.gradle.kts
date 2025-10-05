@@ -19,5 +19,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "ReplyNoteApp"
+rootProject.name = "NoteStasher"
 include(":app")

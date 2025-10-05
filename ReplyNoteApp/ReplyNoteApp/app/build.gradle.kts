@@ -6,7 +6,7 @@ plugins {
 }
 
 android {
-    namespace = "com.samc.replynoteapp"
+    namespace = "com.vibecode.notestasher"
     compileSdk = 35
     
     packaging {
@@ -23,7 +23,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.samc.replynoteapp"
+        applicationId = "com.vibecode.notestasher"
         minSdk = 24
         targetSdk = 35
         versionCode = 2
@@ -68,6 +68,7 @@ dependencies {
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
     implementation(libs.androidx.work.runtime.ktx)
+    implementation("com.google.android.play:app-update-ktx:2.1.0")
     
     // Browser for opening links if needed
     implementation("androidx.browser:browser:1.7.0")
