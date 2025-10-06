@@ -1,0 +1,14 @@
+function debugStatsDelta(docId) {
+  const props = PropertiesService.getScriptProperties();
+  const lastContentKey = 'lastContent_' + docId;
+  const saved = props.getProperty(lastContentKey) || '';
+  const doc = DocumentApp.openById(docId);
+  const cleanText = doc.getBody()
+    .getText()
+    .replace(/[⏰⏳⌛️⏳️][\s\S]*?Status: .*?(?:\n|$)/g, '');
+  const difference = cleanText.length - saved.length;
+  Logger.log('Saved length: ' + saved.length);
+  Logger.log('Current length: ' + cleanText.length);
+  Logger.log('Difference: ' + difference);
+  Logger.log('Would count as bigChange (>|5|)?: ' + (Math.abs(difference) > 5));
+}

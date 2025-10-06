@@ -3,6 +3,29 @@
 function doGet(e) { return handleRequest(e); }
 function doPost(e) { return handleRequest(e); }
 
+
+function setRegistryConfig() {
+       const props = PropertiesService.getScriptProperties();
+       props.setProperty('registrySheetId', '1ay-MLy9H85MRl49pmhnSrt1qv1w-8VX4SPROECozCU4');
+       props.setProperty('registryApiKey', 'GENERATE-A-STRONG-SECRET-HERE');
+     }
+
+function showScriptProperties() {
+          Logger.log(JSON.stringify(PropertiesService.getScriptProperties().getProperties(), null, 2));
+        }
+
+
+ function updateRegistryApiKey() {
+    PropertiesService.getScriptProperties().setProperty('registryApiKey', 'sam$03');
+  }
+
+
+function showRegistryApiKey() {
+    const props = PropertiesService.getScriptProperties();
+    Logger.log(props.getProperty('registryApiKey'));
+  }
+
+
 // ==================== MAIN HANDLERS ====================
 
 function handleRequest(e) {
@@ -114,115 +137,223 @@ function handleRegisterDoc(token, docId, params) {
 
 // ==================== CORE STATS LOGIC (FINAL FLEXIBLE VERSION) ====================
 
-function updateStats(doc, config) {
-  try {
-    const body = doc.getBody();
-    
-    let paras = body.getParagraphs();
-    while (paras.length > 0 && paras[0].getText().trim() === '') {
+/**
+   * Computes the stats block and timers for a doc.
+   * Uses a SHA-256 hash of the clean user content to detect edits reliably.
+   */
+  function updateStats(doc, config) {
+    try {
+      const body = doc.getBody();
+
+      // Trim blank paragraphs at the top so stats sit neatly
+      let paras = body.getParagraphs();
+      while (paras.length > 0 && paras[0].getText().trim() === '') {
         safeRemovePara(paras[0]);
         paras = body.getParagraphs();
-    }
-    
-    const props = PropertiesService.getScriptProperties();
-    const docId = doc.getId();
+      }
 
-    if (paras.length === 0 && !config.statsTop && !config.statsBottom && !config.statsAnywhere) {
-      return;
-    }
+      if (paras.length === 0 && !config.statsTop && !config.statsBottom && !config.statsAnywhere) {
+        return;
+      }
 
-    // --- Calculation Phase ---
-    const lastContentKey = 'lastContent_' + docId;
-    const lastChangeTimeKey = 'lastChangeTime_' + docId;
-    const longestTimeKey = 'longestTime_' + docId;
-    const lastLiveTimeKey = 'lastLiveTime_' + docId;
-    let lastStoredContent = props.getProperty(lastContentKey) || '';
-    let lastChangeTime = parseInt(props.getProperty(lastChangeTimeKey), 10) || null;
-    let longestTime = parseInt(props.getProperty(longestTimeKey) || '0', 10);
-    let lastLiveTime = parseInt(props.getProperty(lastLiveTimeKey) || '0', 10);
-    let fullText = body.getText();
-    let cleanText = fullText.replace(/[⏰⏳⌛️⏳️][\s\S]*?Status: .*?(?:\n|$)/g, '');
-    let bigChange = Math.abs(cleanText.length - lastStoredContent.length) > 5;
-    const now = new Date();
-    if (bigChange || !lastChangeTime) {
-      lastChangeTime = now;
-      if (bigChange) lastLiveTime = now;
-    } else if (!lastLiveTime) {
-      lastLiveTime = now;
-    }
-    const elapsedTime = Math.max(now - lastChangeTime, 0);
-    const newLongestTime = Math.max(longestTime, elapsedTime);
-    const tz = config.timezone || 'UTC';
-    const timestampStr = Utilities.formatDate(new Date(lastChangeTime), tz, 'dd/MM/yyyy hh:mm:ss a');
-    const status = elapsedTime < 2 * 60 * 1000 ? "Live" : "Away";
-    const clockStatsText = '⏰\n' + 'Last edit: ' + timestampStr + ' — ' + formatElapsedTime(elapsedTime) + ' ago\n' + 'Longest time away: ' + formatElapsedTime(newLongestTime) + '\n' + 'Status: ' + status;
-    const sandTimerStatsText = '⏳\r\n' + 'Last edit: ' + timestampStr + ' — ' + formatElapsedTime(elapsedTime) + ' ago\n' + 'Longest time away: ' + formatElapsedTime(newLongestTime) + '\n' + 'Status: ' + status;
+      const props = PropertiesService.getScriptProperties();
+      const docId = doc.getId();
 
-    // --- Top Stats Logic ---
-    let topPara = (paras.length > 0 && isStatsPara(paras[0])) ? paras[0] : null;
-    if (config.statsTop) {
-      if (topPara) { topPara.setText(clockStatsText); } 
-      else { body.insertParagraph(0, clockStatsText); }
-    } else if (topPara) {
-      safeRemovePara(topPara);
-    }
+      const lastContentHashKey = 'lastContentHash_' + docId;
+      const lastChangeTimeKey  = 'lastChangeTime_'  + docId;
+      const longestTimeKey     = 'longestTime_'     + docId;
+      const lastLiveTimeKey    = 'lastLiveTime_'    + docId;
 
-    // --- Bottom Stats Logic ---
-    const updatedParas = body.getParagraphs();
-    const topIsNowStats = updatedParas.length > 0 && isStatsPara(updatedParas[0]);
-    let bottomFound = false;
-    for (let i = updatedParas.length - 1; i >= (topIsNowStats ? 1 : 0); i--) {
-      if (isStatsPara(updatedParas[i])) {
-        if (config.statsBottom) {
-          updatedParas[i].setText(clockStatsText);
+      const lastStoredHash = props.getProperty(lastContentHashKey) || null;
+      let lastChangeTimeMs = readNumberProperty(props, lastChangeTimeKey);
+      let longestTime     = readNumberProperty(props, longestTimeKey) || 0;
+      let lastLiveTimeMs  = readNumberProperty(props, lastLiveTimeKey);
+
+      // Remove existing stats blocks so we only hash user content
+      const fullText = body.getText();
+      const cleanText = fullText.replace(
+        /[⏰⏳⌛️⏳️][\s\S]*?Status: .*?(?:\n|$)/g,
+        ''
+      );
+
+      const currentHash = computeContentHash(cleanText);
+      const contentChanged = !lastStoredHash || lastStoredHash !== currentHash;
+
+      const nowMs = Date.now();
+
+      if (contentChanged || lastChangeTimeMs === null) {
+        lastChangeTimeMs = nowMs;
+        lastLiveTimeMs = nowMs;
+      } else if (lastLiveTimeMs === null) {
+        lastLiveTimeMs = nowMs;
+      }
+
+      const elapsedTime     = Math.max(nowMs - lastChangeTimeMs, 0);
+      const newLongestTime  = Math.max(longestTime, elapsedTime);
+      const tz              = config.timezone || 'UTC';
+      const timestampStr    = Utilities.formatDate(new Date(lastChangeTimeMs), tz, 'dd/MM/yyyy hh:mm:ss a');
+      const status          = elapsedTime < 2 * 60 * 1000 ? 'Live' : 'Away';
+
+      const clockStatsText =
+        '⏰\n' +
+        `Last edit: ${timestampStr} — ${formatElapsedTime(elapsedTime)} ago\n` +
+        `Longest time away: ${formatElapsedTime(newLongestTime)}\n` +
+        `Status: ${status}`;
+
+      const sandTimerStatsText =
+        '⏳\r\n' +
+        `Last edit: ${timestampStr} — ${formatElapsedTime(elapsedTime)} ago\n` +
+        `Longest time away: ${formatElapsedTime(newLongestTime)}\n` +
+        `Status: ${status}`;
+
+      // Top placement
+      let topPara = (paras.length > 0 && isStatsPara(paras[0])) ? paras[0] : null;
+      if (config.statsTop) {
+        if (topPara) {
+          topPara.setText(clockStatsText);
         } else {
-          safeRemovePara(updatedParas[i]);
+          body.insertParagraph(0, clockStatsText);
         }
-        bottomFound = true;
-        break;
+      } else if (topPara) {
+        safeRemovePara(topPara);
       }
-    }
-    if (!bottomFound && config.statsBottom) {
-      body.appendParagraph(clockStatsText);
-    }
-    
-    // --- Anywhere Timer Stats Logic (Updated for flexible matching) ---
-    const finalParas = body.getParagraphs();
-    const ANYWHERE_MARKERS = ['⏳', '⏳️', '⌛️'];
-    const PRIMARY_ANYWHERE_MARKER = '⏳';
 
-    if (config.statsAnywhere === true) {
-      for (let i = 0; i < finalParas.length; i++) {
-        const para = finalParas[i];
-        const paraText = para.getText();
-        
-        // NEW LOGIC: Check if the paragraph CONTAINS a marker, but is NOT already a stats block.
-        const containsMarker = ANYWHERE_MARKERS.some(marker => paraText.includes(marker));
-        const isAlreadyStats = paraText.includes('Last edit:');
+      // Bottom placement
+      const updatedParas = body.getParagraphs();
+      const topIsNowStats = updatedParas.length > 0 && isStatsPara(updatedParas[0]);
+      let bottomFound = false;
+      for (let i = updatedParas.length - 1; i >= (topIsNowStats ? 1 : 0); i--) {
+        if (isStatsPara(updatedParas[i])) {
+          if (config.statsBottom) {
+            updatedParas[i].setText(clockStatsText);
+          } else {
+            safeRemovePara(updatedParas[i]);
+          }
+          bottomFound = true;
+          break;
+        }
+      }
+      if (!bottomFound && config.statsBottom) {
+        body.appendParagraph(clockStatsText);
+      }
 
-        if (containsMarker && !isAlreadyStats) {
-          para.setText(sandTimerStatsText);
+      // Anywhere stats
+      const finalParas = body.getParagraphs();
+      const ANYWHERE_MARKERS = ['⏳', '⏳️', '⌛️'];
+      const PRIMARY_ANYWHERE_MARKER = '⏳';
+
+      if (config.statsAnywhere === true) {
+        for (let i = 0; i < finalParas.length; i++) {
+          const para = finalParas[i];
+          const paraText = para.getText();
+          const containsMarker = ANYWHERE_MARKERS.some(marker => paraText.includes(marker));
+          const isAlreadyStats = paraText.includes('Last edit:');
+          if (containsMarker && !isAlreadyStats) {
+            para.setText(sandTimerStatsText);
+          }
+        }
+      } else {
+        for (let i = 0; i < finalParas.length; i++) {
+          const text = finalParas[i].getText();
+          if (text.startsWith(PRIMARY_ANYWHERE_MARKER + '\n') ||
+              text.startsWith(PRIMARY_ANYWHERE_MARKER + '\r') ||
+              text.startsWith(PRIMARY_ANYWHERE_MARKER + ' ')) {
+            finalParas[i].setText(PRIMARY_ANYWHERE_MARKER);
+          }
         }
       }
-    } else if (config.statsAnywhere === false) {
-      for (let i = 0; i < finalParas.length; i++) {
-        const text = finalParas[i].getText();
-        if (text.startsWith(PRIMARY_ANYWHERE_MARKER + '\n') || text.startsWith(PRIMARY_ANYWHERE_MARKER + '\r') || text.startsWith(PRIMARY_ANYWHERE_MARKER + ' ')) {
-          // Revert to a paragraph with only the marker.
-          finalParas[i].setText(PRIMARY_ANYWHERE_MARKER);
-        }
-      }
+
+      // Persist state
+      lastLiveTimeMs = lastLiveTimeMs !== null ? lastLiveTimeMs : nowMs;
+      props.setProperty(lastChangeTimeKey, String(lastChangeTimeMs));
+      props.setProperty(lastLiveTimeKey, String(lastLiveTimeMs));
+      props.setProperty(longestTimeKey, String(newLongestTime));
+      props.setProperty(lastContentHashKey, currentHash);
+
+    } catch (e) {
+      Logger.log('CRITICAL Error in updateStats: ' + e.toString() + ' Stack: ' + e.stack);
     }
-    
-    // --- Save Properties ---
-    props.setProperty(lastChangeTimeKey, lastChangeTime.toString());
-    props.setProperty(lastLiveTimeKey, lastLiveTime.toString());
-    props.setProperty(longestTimeKey, newLongestTime.toString());
-    props.setProperty(lastContentKey, cleanText);
-    
-  } catch (e) {
-    Logger.log('CRITICAL Error in updateStats: ' + e.toString() + ' Stack: ' + e.stack);
   }
+
+  /**
+   * Returns a hex string of the SHA-256 hash of cleanText.
+   */
+ function computeContentHash(cleanText) {
+    const blob  = Utilities.newBlob(cleanText || '', 'text/plain');
+    const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, blob.getBytes());
+    return bytes.map(b => ('0' + (b & 0xFF).toString(16)).slice(-2)).join('');
+  }
+
+  function debugContentHash(docId) {
+    const props = PropertiesService.getScriptProperties();
+    const lastContentHashKey = 'lastContentHash_' + docId;
+    const storedHash = props.getProperty(lastContentHashKey) || '(none)';
+    const doc = DocumentApp.openById(docId);
+    const cleanText = doc.getBody()
+      .getText()
+      .replace(/[⏰⏳⌛️⏳️][\s\S]*?Status: .*?(?:\n|$)/g, '');
+    const currentHash = computeContentHash(cleanText);
+    Logger.log('Stored hash:  ' + storedHash);
+    Logger.log('Current hash: ' + currentHash);
+    Logger.log('hashChanged? ' + (storedHash !== currentHash));
+  }
+
+
+
+
+  /**
+   * Reads a stored string and converts it to a number. Returns null if missing/invalid.
+   * (Reuses the existing readNumberProperty helper you already have.)
+   */
+  function readNumberProperty(props, key) {
+    const raw = props.getProperty(key);
+    if (!raw) return null;
+    const num = Number(raw);
+    if (Number.isFinite(num)) {
+      return num;
+    }
+    Logger.log('Invalid numeric property for ' + key + ': ' + raw);
+    return null;
+  }
+
+
+ function testUpdateStatsWithLog(token, docId) {
+    const e = { parameter: { action: 'updateStats', token: token, docId: docId } };
+    handleRequest(e);
+    Logger.log('Ran updateStats for doc ' + docId);
+  }
+
+   function debugContentHashDoc1() {
+    debugContentHash('1a_XVWpPuWBn6ytRJ-HcJ3kAgfaok2VQIvepEqoeHoH4');
+  }
+
+
+  function debugContentHash(docId) {
+    const props = PropertiesService.getScriptProperties();
+    const lastContentHashKey = 'lastContentHash_' + docId;
+    const storedHash = props.getProperty(lastContentHashKey) || '(none)';
+    const doc = DocumentApp.openById(docId);
+    const cleanText = doc.getBody()
+      .getText()
+      .replace(/[⏰⏳⌛️⏳️][\s\S]*?Status: .*?(?:\n|$)/g, '');
+    const currentHash = computeContentHash(cleanText);
+    Logger.log('Stored hash:  ' + storedHash);
+    Logger.log('Current hash: ' + currentHash);
+    Logger.log('hashChanged? ' + (storedHash !== currentHash));
+  }
+
+
+
+
+function readNumberProperty(props, key) {
+  const raw = props.getProperty(key);
+  if (!raw) return null;
+  const num = Number(raw);
+  if (Number.isFinite(num)) {
+    return num;
+  }
+  Logger.log('Invalid numeric property for ' + key + ': ' + raw);
+  return null;
 }
 // ==================== HELPER FUNCTIONS ====================
 
@@ -366,3 +497,53 @@ function inspectConfigForDoc(docId) {
     Logger.log("!!! ERROR inspecting config: " + e.toString());
   }
 }
+
+function testUpdateStats() {
+    const e = {
+      parameter: {
+        token: '0a153219-14fe-407f-91b7-2e9a5093ace6',
+        docId: '1a_XVWpPuWBn6ytRJ-HcJ3kAgfaok2VQIvepEqoeHoH4',
+        action: 'updateStats'
+      }
+    };
+    handleRequest(e);
+  }
+
+function debugStatsDelta(docId) {
+    const props = PropertiesService.getScriptProperties();
+    const lastContentKey = 'lastContent_' + docId;
+    const saved = props.getProperty(lastContentKey) || '';
+    const doc = DocumentApp.openById(docId);
+    const cleanText = doc.getBody()
+      .getText()
+      .replace(/[⏰⏳⌛️⏳️][\s\S]*?Status: .*?(?:\n|$)/g, '');
+    const difference = cleanText.length - saved.length;
+    Logger.log('Saved length: ' + saved.length);
+    Logger.log('Current length: ' + cleanText.length);
+    Logger.log('Difference: ' + difference);
+    Logger.log('Would count as bigChange (>|5|)?: ' + (Math.abs(difference) > 5));
+  }
+
+function testUpdateStatsWithLog(token, docId) {
+    const e = { parameter: { action: 'updateStats', token: token, docId: docId } };
+    handleRequest(e);  // this opens the doc and calls updateStats internally
+    Logger.log('Ran updateStats for doc ' + docId);
+  }
+
+function runUpdateOnce() {
+    testUpdateStatsWithLog('0a153219-14fe-407f-91b7-2e9a5093ace6', '1a_XVWpPuWBn6ytRJ-HcJ3kAgfaok2VQIvepEqoeHoH4');
+  }
+
+function debugCleanTextDoc1() {
+    debugCleanText('1a_XVWpPuWBn6ytRJ-HcJ3kAgfaok2VQIvepEqoeHoH4');
+  }
+
+function debugCleanText(docId) {
+    const doc = DocumentApp.openById(docId);
+    const cleanText = doc.getBody()
+      .getText()
+      .replace(/[⏰⏳⌛️⏳️][\s\S]*?Status: .*?(?:\n|$)/g, '');
+    Logger.log('Clean text length: ' + cleanText.length);
+    Logger.log('Clean text sample:\n' + cleanText.substring(0, Math.min(200, cleanText.length)));
+  }
+
