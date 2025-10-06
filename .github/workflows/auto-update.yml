@@ -1,20 +1,20 @@
 name: Auto-update document stats
- 
-    on:
-      schedule:
-        - cron: '*/5 * * * *'   # every 5 minutes
-      workflow_dispatch:
- 
-    jobs:
-      update-doc-stats:
-        runs-on: ubuntu-latest
-        steps:
-          - name: Trigger Apps Script scheduler
-            env:
-              APPS_SCRIPT_URL: ${{ secrets.APPS_SCRIPT_URL }}
-              REGISTRY_API_KEY: ${{ secrets.REGISTRY_API_KEY }}
-            run: |
-              set -e
-              RESPONSE=$(curl -sSf --max-time 90 \
-                "${APPS_SCRIPT_URL}?action=triggerUpdates&apiKey=${REGISTRY_API_KEY}")
-              echo "Apps Script response: $RESPONSE"
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # every 5 minutes
+  workflow_dispatch:
+
+jobs:
+  update-doc-stats:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Apps Script scheduler
+        env:
+          APPS_SCRIPT_URL: ${{ secrets.APPS_SCRIPT_URL }}
+          REGISTRY_API_KEY: ${{ secrets.REGISTRY_API_KEY }}
+        run: |
+          set -e
+          RESPONSE=$(curl -sSf --max-time 90 \
+            "${APPS_SCRIPT_URL}?action=triggerUpdates&apiKey=${REGISTRY_API_KEY}")
+          echo "Apps Script response: $RESPONSE"
