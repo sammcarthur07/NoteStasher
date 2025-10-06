@@ -15,6 +15,6 @@ jobs:
           REGISTRY_API_KEY: ${{ secrets.REGISTRY_API_KEY }}
         run: |
           set -e
-          RESPONSE=$(curl -sSf --max-time 90 \
+          RESPONSE=$(curl -LsSf --max-time 90 \
             "${APPS_SCRIPT_URL}?action=triggerUpdates&apiKey=${REGISTRY_API_KEY}")
           echo "Apps Script response: $RESPONSE"
