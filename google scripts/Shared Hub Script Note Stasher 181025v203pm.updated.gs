@@ -1,0 +1,897 @@
+// Shared Hub Script for ReplyNote App (Enhanced quota-aware version)
+
+const HUB_PROPERTY_KEYS = {
+  HUB_URL: 'hubUrl',
+  MASTER_PASSWORD: 'masterPassword',
+  QUOTA_DAILY_LIMIT: 'quotaDailyLimit',
+  FREE_DAILY_QUOTA: 'freeDailyQuota',
+  BULK_CAP_BYTES: 'bulkUploadCapBytes',
+  FREE_QUOTA_SUSPENDED: 'freeQuotaSuspended',
+  GLOBAL_SYNC_SUSPENDED: 'globalSyncSuspended',
+  TOTAL_CLOUD_SENDS: 'totalCloudSends',
+  FREE_SENDS_TODAY: 'freeSendsToday',
+  PAID_SENDS_TODAY: 'paidSendsToday',
+  LAST_COUNTER_RESET: 'dailyCountersDate',
+  LAST_QUOTA_CHECK: 'lastQuotaCheck',
+  CONSECUTIVE_ERRORS: 'consecutiveSyncErrors'
+};
+
+const HUB_DEFAULTS = {
+  FREE_DAILY_QUOTA: 3,
+  QUOTA_DAILY_LIMIT: 20000
+};
+
+function doGet(e) { return handleRequest(e); }
+function doPost(e) { return handleRequest(e); }
+
+function parseBoolean(value, fallback) {
+  if (value === undefined || value === null || value === '') {
+    return fallback;
+  }
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  const normalized = String(value).toLowerCase();
+  return normalized === 'true' || normalized === '1' || normalized === 'yes';
+}
+
+function parseInteger(value, fallback) {
+  if (value === undefined || value === null || value === '') {
+    return fallback;
+  }
+  const parsed = parseInt(value, 10);
+  return isNaN(parsed) ? fallback : parsed;
+}
+
+function ensureDailyCounters(props) {
+  const today = Utilities.formatDate(new Date(), 'UTC', 'yyyy-MM-dd');
+  const lastReset = props.getProperty(HUB_PROPERTY_KEYS.LAST_COUNTER_RESET);
+  if (lastReset !== today) {
+    props.setProperty(HUB_PROPERTY_KEYS.FREE_SENDS_TODAY, '0');
+    props.setProperty(HUB_PROPERTY_KEYS.PAID_SENDS_TODAY, '0');
+    props.setProperty(HUB_PROPERTY_KEYS.LAST_COUNTER_RESET, today);
+  }
+}
+
+function incrementCounter(props, key) {
+  const current = parseInteger(props.getProperty(key), 0);
+  props.setProperty(key, String(current + 1));
+}
+
+function loadHubSettings() {
+  const props = PropertiesService.getScriptProperties();
+  ensureDailyCounters(props);
+  if (!props.getProperty(HUB_PROPERTY_KEYS.FREE_DAILY_QUOTA)) {
+    props.setProperty(HUB_PROPERTY_KEYS.FREE_DAILY_QUOTA, String(HUB_DEFAULTS.FREE_DAILY_QUOTA));
+  }
+  if (!props.getProperty(HUB_PROPERTY_KEYS.QUOTA_DAILY_LIMIT)) {
+    props.setProperty(HUB_PROPERTY_KEYS.QUOTA_DAILY_LIMIT, String(HUB_DEFAULTS.QUOTA_DAILY_LIMIT));
+  }
+  return {
+    props: props,
+    freeDailyQuota: parseInteger(props.getProperty(HUB_PROPERTY_KEYS.FREE_DAILY_QUOTA), HUB_DEFAULTS.FREE_DAILY_QUOTA),
+    freeQuotaSuspended: parseBoolean(props.getProperty(HUB_PROPERTY_KEYS.FREE_QUOTA_SUSPENDED), false),
+    globalSyncSuspended: parseBoolean(props.getProperty(HUB_PROPERTY_KEYS.GLOBAL_SYNC_SUSPENDED), false)
+  };
+}
+
+
+function setRegistryConfig() {
+       const props = PropertiesService.getScriptProperties();
+       props.setProperty('registrySheetId', '1ay-MLy9H85MRl49pmhnSrt1qv1w-8VX4SPROECozCU4');
+       props.setProperty('registryApiKey', 'sam$03');
+     }
+
+function showScriptProperties() {
+          Logger.log(JSON.stringify(PropertiesService.getScriptProperties().getProperties(), null, 2));
+        }
+
+
+ function updateRegistryApiKey() {
+    PropertiesService.getScriptProperties().setProperty('registryApiKey', 'sam$03');
+  }
+
+  function showRegistrySettings() {
+      Logger.log(PropertiesService.getScriptProperties().getProperties());
+    }
+
+
+function showRegistryApiKey() {
+    const props = PropertiesService.getScriptProperties();
+    Logger.log(props.getProperty('registryApiKey'));
+  }
+
+function testListDocs() {
+      const response = handleListDocs({ apiKey: 'sam$03' });
+      Logger.log(response.getContent());
+    }
+
+function debugRegistryHash(docId) {
+      const props = PropertiesService.getScriptProperties();
+      const lastHash = props.getProperty('lastContentHash_' + docId) || '(none)';
+      const doc = DocumentApp.openById(docId);
+      const clean = doc.getBody().getText().replace(/[⏰⏳⌛️⏳️][\s\S]*?Status: .*?(?:\n|$)/g, '');
+      const currentHash = computeContentHash(clean);
+      Logger.log('lastHash    : ' + lastHash);
+      Logger.log('currentHash : ' + currentHash);
+      Logger.log('changed?    : ' + (lastHash !== currentHash));
+    }
+
+    function debugRegistryHashDoc1() {
+    debugRegistryHash('1a_XVWpPuWBn6ytRJ-HcJ3kAgfaok2VQIvepEqoeHoH4');  // ← replace 
+  }
+
+function debugUpdateStatsRun(token, docId) {
+      const e = { parameter: { action: 'updateStats', token, docId } };
+      handleRequest(e);
+      const props = PropertiesService.getScriptProperties();
+      Logger.log('Post-run hash: ' + props.getProperty('lastContentHash_' + docId));
+    }
+
+    function debugUpdateStatsRunDoc1() {
+      debugUpdateStatsRun('0a153219-14fe-407f-91b7-2e9a5093ace6', '1a_XVWpPuWBn6ytRJ-HcJ3kAgfaok2VQIvepEqoeHoH4');
+    }
+
+function resetTimerProperties(docId) {
+    const props = PropertiesService.getScriptProperties();
+    props.deleteProperty('lastContent_' + docId);
+    props.deleteProperty('lastContentHash_' + docId);
+    props.deleteProperty('lastChangeTime_' + docId);
+    props.deleteProperty('lastLiveTime_' + docId);
+    props.deleteProperty('longestTime_' + docId);
+    Logger.log('Cleared timers for doc ' + docId);
+  }
+
+  // wrapper so you don’t have to type the ID:
+  function resetTimerDoc1() {
+    resetTimerProperties('1a_XVWpPuWBn6ytRJ-HcJ3kAgfaok2VQIvepEqoeHoH4');
+  }
+
+function manualRegisterDoc1() {
+    handleRegisterDoc(
+      '0a153219-14fe-407f-91b7-2e9a5093ace6',
+      '1a_XVWpPuWBn6ytRJ-HcJ3kAgfaok2VQIvepEqoeHoH4',
+      {
+        statsTop: 'true',
+        statsBottom: 'true',
+        statsAnywhere: 'true',
+        timezone: 'Australia/Brisbane',
+        autoIntervalMinutes: '5',
+        alias: 'My Doc'
+      },
+      null
+    );
+  }
+
+function debugRegistryHashDoc1() {
+      debugRegistryHash('1a_XVWpPuWBn6ytRJ-HcJ3kAgfaok2VQIvepEqoeHoH4');
+    }
+
+
+// ==================== MAIN HANDLERS ====================
+
+function handleRequest(e) {
+  try {
+    const params = e && e.parameter ? e.parameter : {};
+    let action = params.action || 'append';
+    let payload = null;
+
+    if (e && e.postData && e.postData.contents) {
+      try {
+        payload = JSON.parse(e.postData.contents);
+        if (payload && payload.mode) {
+          action = payload.mode;
+        }
+      } catch (err) {
+        // Ignore JSON parse issues; we fall back to URL params.
+      }
+    }
+
+    switch (action) {
+      case 'triggerUpdates':
+        return handleTriggerUpdates(params);
+      case 'listDocs':
+        return handleListDocs(params);
+      case 'health':
+        return createResponse({ status: 'ok' });
+      case 'append':
+      case 'setConfig':
+      case 'applyStatsSettings':
+      case 'registerDoc':
+      case 'updateStats': {
+        const token = params.token;
+        const docId = params.docId;
+        if (!token || !docId) {
+          return createResponse({ error: 'Invalid token or docId' }, 400);
+        }
+
+        switch (action) {
+          case 'append':
+            return handleAppend(token, docId, e, payload);
+          case 'setConfig':
+          case 'applyStatsSettings':
+            return handleSetConfig(token, docId, params, payload);
+          case 'registerDoc':
+            return handleRegisterDoc(token, docId, params);
+          case 'updateStats': {
+            const doc = DocumentApp.openById(docId);
+            const config = getDocConfig(token, docId);
+            updateStats(doc, config);
+            return createResponse({ success: true, message: 'Stats updated' });
+          }
+        }
+      }
+      default:
+        return createResponse({ error: 'Unknown action: ' + action }, 400);
+    }
+  } catch (error) {
+    Logger.log('Error in handleRequest: ' + error.toString() + ' Stack: ' + error.stack);
+    return createResponse({ error: 'Critical Error: ' + error.toString() }, 500);
+  }
+}
+
+function handleAppend(token, docId, e, payload) {
+  const settings = loadHubSettings();
+  const props = settings.props;
+  const tierParam = ((e.parameter && e.parameter.tier) || (payload && payload.tier) || 'free').toString().toLowerCase();
+  const isPaidTier = tierParam === 'essential' || tierParam === 'power' || tierParam === 'paid';
+
+  if (settings.globalSyncSuspended) {
+    return createResponse({
+      status: 'paused',
+      reason: 'global',
+      message: 'Cloud sync temporarily unavailable'
+    }, 503);
+  }
+
+  if (!isPaidTier && settings.freeQuotaSuspended) {
+    return createResponse({
+      status: 'paused',
+      reason: 'free',
+      message: 'Free-tier cloud sync is paused'
+    }, 429);
+  }
+
+  const doc = DocumentApp.openById(docId);
+  const body = doc.getBody();
+  const config = getDocConfig(token, docId);
+
+  const content = e.parameter.text || (e.postData ? e.postData.contents : '');
+  if (!content) return createResponse({error: 'No content to append'}, 400);
+
+  const paras = body.getParagraphs();
+  let insertAt = paras.length;
+  if (config.statsBottom && paras.length > 0 && isStatsPara(paras[paras.length - 1])) {
+    insertAt = paras.length - 1;
+  }
+
+  // --- THE FIX ---
+  // Insert the separator and content with blank lines for correct spacing.
+  body.insertParagraph(insertAt,     "—");
+  body.insertParagraph(insertAt + 1, ""); // Adds blank line after separator
+  body.insertParagraph(insertAt + 2, content);
+  body.insertParagraph(insertAt + 3, ""); // Adds blank line after content
+
+  updateStats(doc, config);
+  incrementCounter(props, HUB_PROPERTY_KEYS.TOTAL_CLOUD_SENDS);
+  if (isPaidTier) {
+    incrementCounter(props, HUB_PROPERTY_KEYS.PAID_SENDS_TODAY);
+  } else {
+    incrementCounter(props, HUB_PROPERTY_KEYS.FREE_SENDS_TODAY);
+  }
+  props.setProperty(HUB_PROPERTY_KEYS.LAST_QUOTA_CHECK, new Date().toISOString());
+  return createResponse({ success: true, message: 'Content appended', tier: isPaidTier ? tierParam : 'free' });
+}
+
+function handleSetConfig(token, docId, params, payload) {
+    const configKey = 'config_' + token + '_' + docId;
+    const config = getDocConfig(token, docId);
+    const settingsSource = payload || params;
+
+    if (settingsSource.statsTop !== undefined) {
+      config.statsTop = settingsSource.statsTop === true || settingsSource.statsTop === 'true';
+    }
+    if (settingsSource.statsBottom !== undefined) {
+      config.statsBottom = settingsSource.statsBottom === true || settingsSource.statsBottom === 'true';
+    }
+    if (settingsSource.statsAnywhere !== undefined) {
+      config.statsAnywhere = settingsSource.statsAnywhere === true || settingsSource.statsAnywhere === 'true';
+    }
+    if (settingsSource.timezone) config.timezone = settingsSource.timezone;
+
+    PropertiesService.getScriptProperties().setProperty(configKey, JSON.stringify(config));
+
+    upsertRegistryEntry({
+      token,
+      docId,
+      alias: settingsSource.alias || '',
+      autoIntervalMinutes: settingsSource.autoIntervalMinutes || 5
+    });
+
+    const doc = DocumentApp.openById(docId);
+    updateStats(doc, config);
+    return createResponse({ success: true, config });
+  }
+
+
+function handleRegisterDoc(token, docId, params, payload) {
+    const configKey = 'config_' + token + '_' + docId;
+    const config = {
+      statsTop: params.statsTop === 'true',
+      statsBottom: params.statsBottom !== 'false',
+      statsAnywhere: params.statsAnywhere === 'true',
+      timezone: params.timezone || 'UTC',
+    };
+    PropertiesService.getScriptProperties().setProperty(configKey, JSON.stringify(config));
+
+    upsertRegistryEntry({
+      token,
+      docId,
+      alias: params.alias || (payload && payload.alias) || '',
+      autoIntervalMinutes: params.autoIntervalMinutes || (payload && payload.autoIntervalMinutes) || 5
+    });
+
+    const doc = DocumentApp.openById(docId);
+    updateStats(doc, config);
+    return createResponse({ success: true, message: 'Document registered' });
+  }
+
+
+// ==================== CORE STATS LOGIC (FINAL FLEXIBLE VERSION) ====================
+
+/*function handleRegisterDoc(token, docId, params, payload) {
+    const configKey = 'config_' + token + '_' + docId;
+    const config = {
+      statsTop: params.statsTop === 'true',
+      statsBottom: params.statsBottom !== 'false',
+      statsAnywhere: params.statsAnywhere === 'true',
+      timezone: params.timezone || 'UTC',
+    };
+    PropertiesService.getScriptProperties().setProperty(configKey, JSON.stringify(config));
+
+    upsertRegistryEntry({
+      token,
+      docId,
+      alias: params.alias || (payload && payload.alias) || '',
+      autoIntervalMinutes: params.autoIntervalMinutes || (payload && payload.autoIntervalMinutes) || 5
+    });
+
+    const doc = DocumentApp.openById(docId);
+    updateStats(doc, config);
+    return createResponse({ success: true, message: 'Document registered' });
+  }
+*
+   * Computes the stats block and timers for a doc.
+   * Uses a SHA-256 hash of the clean user content to detect edits reliably.
+   */
+  function updateStats(doc, config) {
+    try {
+      const body = doc.getBody();
+
+      // Trim blank paragraphs at the top so stats sit neatly
+      let paras = body.getParagraphs();
+      while (paras.length > 0 && paras[0].getText().trim() === '') {
+        safeRemovePara(paras[0]);
+        paras = body.getParagraphs();
+      }
+
+      if (paras.length === 0 && !config.statsTop && !config.statsBottom && !config.statsAnywhere) {
+        return;
+      }
+
+      const props = PropertiesService.getScriptProperties();
+      const docId = doc.getId();
+
+      const lastContentHashKey = 'lastContentHash_' + docId;
+      const lastChangeTimeKey  = 'lastChangeTime_'  + docId;
+      const longestTimeKey     = 'longestTime_'     + docId;
+      const lastLiveTimeKey    = 'lastLiveTime_'    + docId;
+
+      const lastStoredHash = props.getProperty(lastContentHashKey) || null;
+      let lastChangeTimeMs = readNumberProperty(props, lastChangeTimeKey);
+      let longestTime     = readNumberProperty(props, longestTimeKey) || 0;
+      let lastLiveTimeMs  = readNumberProperty(props, lastLiveTimeKey);
+
+      // Remove existing stats blocks so we only hash user content
+      const fullText = body.getText();
+      const cleanText = fullText.replace(
+        /[⏰⏳⌛️⏳️][\s\S]*?Status: .*?(?:\n|$)/g,
+        ''
+      );
+
+      const currentHash = computeContentHash(cleanText);
+      const contentChanged = !lastStoredHash || lastStoredHash !== currentHash;
+
+      const nowMs = Date.now();
+
+      if (contentChanged || lastChangeTimeMs === null) {
+        lastChangeTimeMs = nowMs;
+        lastLiveTimeMs = nowMs;
+      } else if (lastLiveTimeMs === null) {
+        lastLiveTimeMs = nowMs;
+      }
+
+      const elapsedTime     = Math.max(nowMs - lastChangeTimeMs, 0);
+      const newLongestTime  = Math.max(longestTime, elapsedTime);
+      const tz              = config.timezone || 'UTC';
+      const timestampStr    = Utilities.formatDate(new Date(lastChangeTimeMs), tz, 'dd/MM/yyyy hh:mm:ss a');
+      const status          = elapsedTime < 2 * 60 * 1000 ? 'Live' : 'Away';
+
+      const clockStatsText =
+        '⏰\n' +
+        `Last edit: ${timestampStr} — ${formatElapsedTime(elapsedTime)} ago\n` +
+        `Longest time away: ${formatElapsedTime(newLongestTime)}\n` +
+        `Status: ${status}`;
+
+      const sandTimerStatsText =
+        '⏳\r\n' +
+        `Last edit: ${timestampStr} — ${formatElapsedTime(elapsedTime)} ago\n` +
+        `Longest time away: ${formatElapsedTime(newLongestTime)}\n` +
+        `Status: ${status}`;
+
+      // Top placement
+      let topPara = (paras.length > 0 && isStatsPara(paras[0])) ? paras[0] : null;
+      if (config.statsTop) {
+        if (topPara) {
+          topPara.setText(clockStatsText);
+        } else {
+          body.insertParagraph(0, clockStatsText);
+        }
+      } else if (topPara) {
+        safeRemovePara(topPara);
+      }
+
+      // Bottom placement
+      const updatedParas = body.getParagraphs();
+      const topIsNowStats = updatedParas.length > 0 && isStatsPara(updatedParas[0]);
+      let bottomFound = false;
+      for (let i = updatedParas.length - 1; i >= (topIsNowStats ? 1 : 0); i--) {
+        if (isStatsPara(updatedParas[i])) {
+          if (config.statsBottom) {
+            updatedParas[i].setText(clockStatsText);
+          } else {
+            safeRemovePara(updatedParas[i]);
+          }
+          bottomFound = true;
+          break;
+        }
+      }
+      if (!bottomFound && config.statsBottom) {
+        body.appendParagraph(clockStatsText);
+      }
+
+      // Anywhere stats
+      const finalParas = body.getParagraphs();
+      const ANYWHERE_MARKERS = ['⏳', '⏳️', '⌛️'];
+      const PRIMARY_ANYWHERE_MARKER = '⏳';
+
+      if (config.statsAnywhere === true) {
+        for (let i = 0; i < finalParas.length; i++) {
+          const para = finalParas[i];
+          const paraText = para.getText();
+          const containsMarker = ANYWHERE_MARKERS.some(marker => paraText.includes(marker));
+          const isAlreadyStats = paraText.includes('Last edit:');
+          if (containsMarker && !isAlreadyStats) {
+            para.setText(sandTimerStatsText);
+          }
+        }
+      } else {
+        for (let i = 0; i < finalParas.length; i++) {
+          const text = finalParas[i].getText();
+          if (text.startsWith(PRIMARY_ANYWHERE_MARKER + '\n') ||
+              text.startsWith(PRIMARY_ANYWHERE_MARKER + '\r') ||
+              text.startsWith(PRIMARY_ANYWHERE_MARKER + ' ')) {
+            finalParas[i].setText(PRIMARY_ANYWHERE_MARKER);
+          }
+        }
+      }
+
+      // Persist state
+      lastLiveTimeMs = lastLiveTimeMs !== null ? lastLiveTimeMs : nowMs;
+      props.setProperty(lastChangeTimeKey, String(lastChangeTimeMs));
+      props.setProperty(lastLiveTimeKey, String(lastLiveTimeMs));
+      props.setProperty(longestTimeKey, String(newLongestTime));
+      props.setProperty(lastContentHashKey, currentHash);
+
+    } catch (e) {
+      Logger.log('CRITICAL Error in updateStats: ' + e.toString() + ' Stack: ' + e.stack);
+    }
+  }
+
+  /**
+   * Returns a hex string of the SHA-256 hash of cleanText.
+   */
+ function computeContentHash(cleanText) {
+    const blob  = Utilities.newBlob(cleanText || '', 'text/plain');
+    const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, blob.getBytes());
+    return bytes.map(b => ('0' + (b & 0xFF).toString(16)).slice(-2)).join('');
+  }
+
+  function debugContentHash(docId) {
+    const props = PropertiesService.getScriptProperties();
+    const lastContentHashKey = 'lastContentHash_' + docId;
+    const storedHash = props.getProperty(lastContentHashKey) || '(none)';
+    const doc = DocumentApp.openById(docId);
+    const cleanText = doc.getBody()
+      .getText()
+      .replace(/[⏰⏳⌛️⏳️][\s\S]*?Status: .*?(?:\n|$)/g, '');
+    const currentHash = computeContentHash(cleanText);
+    Logger.log('Stored hash:  ' + storedHash);
+    Logger.log('Current hash: ' + currentHash);
+    Logger.log('hashChanged? ' + (storedHash !== currentHash));
+  }
+
+
+
+
+  /**
+   * Reads a stored string and converts it to a number. Returns null if missing/invalid.
+   * (Reuses the existing readNumberProperty helper you already have.)
+   */
+  function readNumberProperty(props, key) {
+    const raw = props.getProperty(key);
+    if (!raw) return null;
+    const num = Number(raw);
+    if (Number.isFinite(num)) {
+      return num;
+    }
+    Logger.log('Invalid numeric property for ' + key + ': ' + raw);
+    return null;
+  }
+
+
+ function testUpdateStatsWithLog(token, docId) {
+    const e = { parameter: { action: 'updateStats', token: token, docId: docId } };
+    handleRequest(e);
+    Logger.log('Ran updateStats for doc ' + docId);
+  }
+
+   function debugContentHashDoc1() {
+    debugContentHash('1a_XVWpPuWBn6ytRJ-HcJ3kAgfaok2VQIvepEqoeHoH4');
+  }
+
+
+  function debugContentHash(docId) {
+    const props = PropertiesService.getScriptProperties();
+    const lastContentHashKey = 'lastContentHash_' + docId;
+    const storedHash = props.getProperty(lastContentHashKey) || '(none)';
+    const doc = DocumentApp.openById(docId);
+    const cleanText = doc.getBody()
+      .getText()
+      .replace(/[⏰⏳⌛️⏳️][\s\S]*?Status: .*?(?:\n|$)/g, '');
+    const currentHash = computeContentHash(cleanText);
+    Logger.log('Stored hash:  ' + storedHash);
+    Logger.log('Current hash: ' + currentHash);
+    Logger.log('hashChanged? ' + (storedHash !== currentHash));
+  }
+
+
+
+
+function readNumberProperty(props, key) {
+  const raw = props.getProperty(key);
+  if (!raw) return null;
+  const num = Number(raw);
+  if (Number.isFinite(num)) {
+    return num;
+  }
+  Logger.log('Invalid numeric property for ' + key + ': ' + raw);
+  return null;
+}
+// ==================== HELPER FUNCTIONS ====================
+
+function getDocConfig(token, docId) {
+  const configKey = 'config_' + token + '_' + docId;
+  const configStr = PropertiesService.getScriptProperties().getProperty(configKey);
+  if (configStr) return JSON.parse(configStr);
+  return { statsTop: false, statsBottom: true, statsAnywhere: false, timezone: 'UTC' };
+}
+
+function isStatsPara(para) {
+  try {
+    // Only check for clock emoji, not sand timer
+    return para && para.getType() === DocumentApp.ElementType.PARAGRAPH && para.getText().startsWith('⏰');
+  } catch (e) { return false; }
+}
+
+function safeRemovePara(para) {
+  try {
+    const parent = para.getParent();
+    const index = parent.getChildIndex(para);
+    if (index === parent.getNumChildren() - 1) {
+      para.clear(); 
+    } else {
+      para.removeFromParent();
+    }
+  } catch (e) {
+    try { para.setText(''); } catch (e2) {}
+  }
+}
+
+function formatElapsedTime(ms) {
+    if (ms < 1000) return "0 sec";
+    const sec = 1000, min = 60 * sec, hour = 60 * min, day = 24 * hour;
+    let parts = [];
+    const days = Math.floor(ms / day); if (days > 0) parts.push(days + (days > 1 ? ' days' : ' day')); ms %= day;
+    const hours = Math.floor(ms / hour); if (hours > 0) parts.push(hours + (hours > 1 ? ' hours' : ' hour')); ms %= hour;
+    const minutes = Math.floor(ms / min); if (minutes > 0) parts.push(minutes + ' min'); ms %= min;
+    const seconds = Math.floor(ms / sec); if (seconds > 0 || parts.length === 0) parts.push(seconds + ' sec');
+    return parts.join(', ');
+}
+
+function createResponse(data, status) {
+  const output = ContentService.createTextOutput(JSON.stringify(data))
+    .setMimeType(ContentService.MimeType.JSON);
+  if (status) {
+    output.setResponseCode(status);
+  }
+  return output;
+}
+
+
+/******************************************************************************
+   * Registry helpers (Google Sheet backing the GitHub Action)
+   ******************************************************************************/
+  const SCRIPT_PROP_REGISTRY_SHEET_ID = 'registrySheetId';
+  const SCRIPT_PROP_REGISTRY_API_KEY  = 'registryApiKey';
+  const REGISTRY_HEADERS = ['Token', 'DocId', 'Alias', 'AutoIntervalMinutes', 'LastAutoRunMs'];
+
+  function getRegistrySheet() {
+    const sheetId = PropertiesService.getScriptProperties().getProperty(SCRIPT_PROP_REGISTRY_SHEET_ID);
+    if (!sheetId) throw new Error('registrySheetId not set. Run setRegistryConfig() first.');
+    const ss = SpreadsheetApp.openById(sheetId);
+    const sheet = ss.getSheetByName('Registry') || ss.getSheets()[0] || ss.insertSheet('Registry');
+    if (sheet.getLastRow() === 0) sheet.appendRow(REGISTRY_HEADERS);
+    return sheet;
+  }
+
+  function upsertRegistryEntry({ token, docId, alias, autoIntervalMinutes }) {
+    const sheet = getRegistrySheet();
+    const values = sheet.getDataRange().getValues();
+    const interval = Math.max(Number(autoIntervalMinutes) || 5, 1);
+
+    let found = false;
+    for (let i = 1; i < values.length; i++) {
+      if ((values[i][0] || '') === token && (values[i][1] || '') === docId) {
+        values[i][2] = alias || values[i][2] || '';
+        values[i][3] = interval;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      values.push([token, docId, alias || '', interval, 0]);
+    }
+    sheet.getRange(1, 1, values.length, values[0].length).setValues(values);
+  }
+
+  function triggerScheduledUpdates() {
+    const sheet = getRegistrySheet();
+    const values = sheet.getDataRange().getValues();
+    if (values.length <= 1) return { updated: 0, skipped: 0, errors: [] };
+
+    const now = Date.now();
+    let updated = 0, skipped = 0;
+    const errors = [];
+
+    for (let i = 1; i < values.length; i++) {
+      const token = values[i][0];
+      const docId = values[i][1];
+      if (!token || !docId) { skipped++; continue; }
+
+      const alias = values[i][2];
+      const intervalMinutes = Math.max(Number(values[i][3]) || 5, 1);
+      const lastAutoRunMs = Number(values[i][4]) || 0;
+      const intervalMs = intervalMinutes * 60 * 1000;
+
+      if (now - lastAutoRunMs < intervalMs) { skipped++; continue; }
+
+      try {
+        const doc = DocumentApp.openById(docId);
+        const config = getDocConfig(token, docId);
+        updateStats(doc, config);
+        values[i][4] = now;
+        updated++;
+      } catch (err) {
+        errors.push({ docId, message: err.message });
+      }
+    }
+
+    sheet.getRange(1, 1, values.length, values[0].length).setValues(values);
+    return { updated, skipped, errors };
+  }
+
+  function handleTriggerUpdates(params) {
+    const props = PropertiesService.getScriptProperties();
+    const expectedKey = props.getProperty(SCRIPT_PROP_REGISTRY_API_KEY);
+    if (!expectedKey) return createResponse({ error: 'registryApiKey not set' }, 500);
+    if (params.apiKey !== expectedKey) return createResponse({ error: 'Forbidden' }, 403);
+
+    const result = triggerScheduledUpdates();
+    return createResponse({ success: true, updated: result.updated, skipped: result.skipped, errors: result.errors });
+  }
+
+  function handleListDocs(params) {
+    const props = PropertiesService.getScriptProperties();
+    const expectedKey = props.getProperty(SCRIPT_PROP_REGISTRY_API_KEY);
+    if (!expectedKey) return createResponse({ error: 'registryApiKey not set' }, 500);
+    if (params.apiKey !== expectedKey) return createResponse({ error: 'Forbidden' }, 403);
+
+    const sheet = getRegistrySheet();
+    const values = sheet.getDataRange().getValues();
+    const docs = [];
+
+    for (let i = 1; i < values.length; i++) {
+      const token = values[i][0];
+      const docId = values[i][1];
+      if (!token || !docId) continue;
+
+      let title = '(doc not found)';
+      try { title = DocumentApp.openById(docId).getName(); } catch (e) {}
+      docs.push({
+        token,
+        docId,
+        alias: values[i][2],
+        autoIntervalMinutes: Number(values[i][3]) || 5,
+        lastAutoRunMs: Number(values[i][4]) || 0,
+        title
+      });
+    }
+
+    return createResponse({ success: true, docs });
+  }
+
+
+
+
+
+/**
+ * A dedicated test function to run our sand timer diagnostic.
+ * This simulates unchecking the "Every ⏳" box.
+ */
+function testRemoveSandTimers() {
+  const testParameters = {
+    docId: '1s5LFnee5GdTKu0YbfKFfDVkg49GhGICs7z9lzdPkbcU',
+    token: '92b2bedb-1371-4aaf-be7f-74bb8f3078bd', // Your specific token
+    action: 'setConfig',
+    statsAnywhere: 'false' // The action we want to test
+  };
+
+  const e = {
+    parameter: testParameters
+  };
+
+  try {
+    Logger.log("--- Starting testRemoveSandTimers ---");
+    // This test will call the main handleRequest, which in turn runs the
+    // updateStats function containing our new diagnostic logs.
+    handleRequest(e); 
+    Logger.log("--- Test Finished ---");
+  } catch(err) {
+    Logger.log("!!! ERROR in test function: " + err.toString());
+  }
+}
+
+
+/**
+ * A diagnostic helper to be called from a test function.
+ * This is not currently used, as logging is now inside updateStats.
+ * You can keep it for future use or remove it.
+ */
+function diagnoseSandTimerRemoval(docId) {
+  // This function is for standalone diagnostics.
+  // The main logging is now inside updateStats for a more integrated test.
+}
+
+/**
+ * A test to inspect the saved settings for both documents.
+ * BOTH DOCUMENT IDs ARE NOW CORRECTLY FILLED IN.
+ */
+function testInspectConfigs() {
+  const docId1 = '1s5LFnee5GdTKu0YbfKFfDVkg49GhGICs7z9lzdPkbcU'; // The first doc
+  const docId2 = '1EwAAB8mcltV_tmZiaBU0MpKEOsQDJEORCqZedD0Uio0';   // The second doc
+
+  Logger.log("--- Inspecting Config for Document 1 ---");
+  inspectConfigForDoc(docId1);
+  
+  Logger.log("\n--- Inspecting Config for Document 2 ---");
+  inspectConfigForDoc(docId2);
+}
+
+/**
+ * A test to simulate turning ON the sand timer for ONLY the second document.
+ * THE DOCUMENT ID IS NOW CORRECTLY FILLED IN.
+ */
+function testEnableSandTimerOnDoc2() {
+  const testParameters = {
+    docId: '1EwAAB8mcltV_tmZiaBU0MpKEOsQDJEORCqZedD0Uio0', // The second doc
+    token: '92b2bedb-1371-4aaf-bef-74bb8f3078bd',
+    action: 'setConfig',
+    statsAnywhere: 'true' // Explicitly turn this on
+  };
+
+  const e = { parameter: testParameters };
+
+  try {
+    Logger.log("--- Running testEnableSandTimerOnDoc2 ---");
+    handleRequest(e);
+    Logger.log("--- Test Finished ---");
+  } catch (err) {
+    Logger.log("!!! ERROR: " + err.toString());
+  }
+}
+
+/**
+ * Helper function that reads and logs the stored configuration for a given docId.
+ */
+function inspectConfigForDoc(docId) {
+  try {
+    const token = '92b2bedb-1371-4aaf-be7f-74bb8f3078bd'; // Your token
+    const configKey = 'config_' + token + '_' + docId;
+    const configStr = PropertiesService.getScriptProperties().getProperty(configKey);
+
+    if (configStr) {
+      Logger.log("Found saved settings for Doc ID " + docId);
+      Logger.log("Raw JSON string: " + configStr);
+      const config = JSON.parse(configStr);
+      Logger.log("Parsed 'statsAnywhere' value is: " + config.statsAnywhere);
+    } else {
+      Logger.log("No saved settings found for Doc ID " + docId);
+    }
+  } catch(e) {
+    Logger.log("!!! ERROR inspecting config: " + e.toString());
+  }
+}
+
+
+
+function testUpdateStats() {
+    const e = {
+      parameter: {
+        token: '0a153219-14fe-407f-91b7-2e9a5093ace6',
+        docId: '1a_XVWpPuWBn6ytRJ-HcJ3kAgfaok2VQIvepEqoeHoH4',
+        action: 'updateStats'
+      }
+    };
+    handleRequest(e);
+  }
+
+function debugStatsDelta(docId) {
+    const props = PropertiesService.getScriptProperties();
+    const lastContentKey = 'lastContent_' + docId;
+    const saved = props.getProperty(lastContentKey) || '';
+    const doc = DocumentApp.openById(docId);
+    const cleanText = doc.getBody()
+      .getText()
+      .replace(/[⏰⏳⌛️⏳️][\s\S]*?Status: .*?(?:\n|$)/g, '');
+    const difference = cleanText.length - saved.length;
+    Logger.log('Saved length: ' + saved.length);
+    Logger.log('Current length: ' + cleanText.length);
+    Logger.log('Difference: ' + difference);
+    Logger.log('Would count as bigChange (>|5|)?: ' + (Math.abs(difference) > 5));
+  }
+
+function testUpdateStatsWithLog(token, docId) {
+    const e = { parameter: { action: 'updateStats', token: token, docId: docId } };
+    handleRequest(e);  // this opens the doc and calls updateStats internally
+    Logger.log('Ran updateStats for doc ' + docId);
+  }
+
+function runUpdateOnce() {
+    testUpdateStatsWithLog('0a153219-14fe-407f-91b7-2e9a5093ace6', '1a_XVWpPuWBn6ytRJ-HcJ3kAgfaok2VQIvepEqoeHoH4');
+  }
+
+function debugCleanTextDoc1() {
+    debugCleanText('1a_XVWpPuWBn6ytRJ-HcJ3kAgfaok2VQIvepEqoeHoH4');
+  }
+
+function debugCleanText(docId) {
+    const doc = DocumentApp.openById(docId);
+    const cleanText = doc.getBody()
+      .getText()
+      .replace(/[⏰⏳⌛️⏳️][\s\S]*?Status: .*?(?:\n|$)/g, '');
+    Logger.log('Clean text length: ' + cleanText.length);
+    Logger.log('Clean text sample:\n' + cleanText.substring(0, Math.min(200, cleanText.length)));
+  }
+
+  

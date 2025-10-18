@@ -1,5 +1,68 @@
-// Shared Hub Script for ReplyNote App (Fixed Sand Timer Version)
+// Shared Hub Script for ReplyNote / Note Stasher with quota awareness
 
+const HUB_PROPERTY_KEYS = {
+  HUB_URL: 'hubUrl',
+  FREE_DAILY_QUOTA: 'freeDailyQuota',
+  BULK_CAP_BYTES: 'bulkUploadCapBytes',
+  FREE_QUOTA_SUSPENDED: 'freeQuotaSuspended',
+  GLOBAL_SYNC_SUSPENDED: 'globalSyncSuspended',
+  TOTAL_CLOUD_SENDS: 'totalCloudSends',
+  FREE_SENDS_TODAY: 'freeSendsToday',
+  PAID_SENDS_TODAY: 'paidSendsToday',
+  LAST_COUNTER_RESET: 'dailyCountersDate',
+  QUOTA_DAILY_LIMIT: 'quotaDailyLimit',
+  CONSECUTIVE_ERRORS: 'consecutiveSyncErrors'
+};
+
+const HUB_DEFAULTS = {
+  FREE_DAILY_QUOTA: 3,
+  QUOTA_DAILY_LIMIT: 20000
+};
+
+function parseBoolean(value, fallback) {
+  if (value === undefined || value === null || value === '') return fallback;
+  if (typeof value === 'boolean') return value;
+  const normalized = String(value).toLowerCase();
+  return normalized === 'true' || normalized === '1' || normalized === 'yes';
+}
+
+function parseInteger(value, fallback) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const parsed = parseInt(value, 10);
+  return isNaN(parsed) ? fallback : parsed;
+}
+
+function ensureDailyCounters(props) {
+  const today = Utilities.formatDate(new Date(), 'UTC', 'yyyy-MM-dd');
+  const lastReset = props.getProperty(HUB_PROPERTY_KEYS.LAST_COUNTER_RESET);
+  if (lastReset !== today) {
+    props.setProperty(HUB_PROPERTY_KEYS.FREE_SENDS_TODAY, '0');
+    props.setProperty(HUB_PROPERTY_KEYS.PAID_SENDS_TODAY, '0');
+    props.setProperty(HUB_PROPERTY_KEYS.LAST_COUNTER_RESET, today);
+  }
+}
+
+function incrementCounter(props, key) {
+  const current = parseInteger(props.getProperty(key), 0);
+  props.setProperty(key, String(current + 1));
+}
+
+function loadHubSettings() {
+  const props = PropertiesService.getScriptProperties();
+  ensureDailyCounters(props);
+  if (!props.getProperty(HUB_PROPERTY_KEYS.FREE_DAILY_QUOTA)) {
+    props.setProperty(HUB_PROPERTY_KEYS.FREE_DAILY_QUOTA, String(HUB_DEFAULTS.FREE_DAILY_QUOTA));
+  }
+  if (!props.getProperty(HUB_PROPERTY_KEYS.QUOTA_DAILY_LIMIT)) {
+    props.setProperty(HUB_PROPERTY_KEYS.QUOTA_DAILY_LIMIT, String(HUB_DEFAULTS.QUOTA_DAILY_LIMIT));
+  }
+  return {
+    props: props,
+    freeDailyQuota: parseInteger(props.getProperty(HUB_PROPERTY_KEYS.FREE_DAILY_QUOTA), HUB_DEFAULTS.FREE_DAILY_QUOTA),
+    freeQuotaSuspended: parseBoolean(props.getProperty(HUB_PROPERTY_KEYS.FREE_QUOTA_SUSPENDED), false),
+    globalSyncSuspended: parseBoolean(props.getProperty(HUB_PROPERTY_KEYS.GLOBAL_SYNC_SUSPENDED), false)
+  };
+}
 function doGet(e) { return handleRequest(e); }
 function doPost(e) { return handleRequest(e); }
 
@@ -7,7 +70,7 @@ function doPost(e) { return handleRequest(e); }
 function setRegistryConfig() {
        const props = PropertiesService.getScriptProperties();
        props.setProperty('registrySheetId', '1ay-MLy9H85MRl49pmhnSrt1qv1w-8VX4SPROECozCU4');
-       props.setProperty('registryApiKey', 'GENERATE-A-STRONG-SECRET-HERE');
+       props.setProperty('registryApiKey', 'sam$03');
      }
 
 function showScriptProperties() {
@@ -19,65 +82,164 @@ function showScriptProperties() {
     PropertiesService.getScriptProperties().setProperty('registryApiKey', 'sam$03');
   }
 
+  function showRegistrySettings() {
+      Logger.log(PropertiesService.getScriptProperties().getProperties());
+    }
+
 
 function showRegistryApiKey() {
     const props = PropertiesService.getScriptProperties();
     Logger.log(props.getProperty('registryApiKey'));
   }
 
+function testListDocs() {
+      const response = handleListDocs({ apiKey: 'sam$03' });
+      Logger.log(response.getContent());
+    }
+
+function debugRegistryHash(docId) {
+      const props = PropertiesService.getScriptProperties();
+      const lastHash = props.getProperty('lastContentHash_' + docId) || '(none)';
+      const doc = DocumentApp.openById(docId);
+      const clean = doc.getBody().getText().replace(/[⏰⏳⌛️⏳️][\s\S]*?Status: .*?(?:\n|$)/g, '');
+      const currentHash = computeContentHash(clean);
+      Logger.log('lastHash    : ' + lastHash);
+      Logger.log('currentHash : ' + currentHash);
+      Logger.log('changed?    : ' + (lastHash !== currentHash));
+    }
+
+    function debugRegistryHashDoc1() {
+    debugRegistryHash('1a_XVWpPuWBn6ytRJ-HcJ3kAgfaok2VQIvepEqoeHoH4');  // ← replace 
+  }
+
+function debugUpdateStatsRun(token, docId) {
+      const e = { parameter: { action: 'updateStats', token, docId } };
+      handleRequest(e);
+      const props = PropertiesService.getScriptProperties();
+      Logger.log('Post-run hash: ' + props.getProperty('lastContentHash_' + docId));
+    }
+
+    function debugUpdateStatsRunDoc1() {
+      debugUpdateStatsRun('0a153219-14fe-407f-91b7-2e9a5093ace6', '1a_XVWpPuWBn6ytRJ-HcJ3kAgfaok2VQIvepEqoeHoH4');
+    }
+
+function resetTimerProperties(docId) {
+    const props = PropertiesService.getScriptProperties();
+    props.deleteProperty('lastContent_' + docId);
+    props.deleteProperty('lastContentHash_' + docId);
+    props.deleteProperty('lastChangeTime_' + docId);
+    props.deleteProperty('lastLiveTime_' + docId);
+    props.deleteProperty('longestTime_' + docId);
+    Logger.log('Cleared timers for doc ' + docId);
+  }
+
+  // wrapper so you don’t have to type the ID:
+  function resetTimerDoc1() {
+    resetTimerProperties('1a_XVWpPuWBn6ytRJ-HcJ3kAgfaok2VQIvepEqoeHoH4');
+  }
+
+function manualRegisterDoc1() {
+    handleRegisterDoc(
+      '0a153219-14fe-407f-91b7-2e9a5093ace6',
+      '1a_XVWpPuWBn6ytRJ-HcJ3kAgfaok2VQIvepEqoeHoH4',
+      {
+        statsTop: 'true',
+        statsBottom: 'true',
+        statsAnywhere: 'true',
+        timezone: 'Australia/Brisbane',
+        autoIntervalMinutes: '5',
+        alias: 'My Doc'
+      },
+      null
+    );
+  }
+
+function debugRegistryHashDoc1() {
+      debugRegistryHash('1a_XVWpPuWBn6ytRJ-HcJ3kAgfaok2VQIvepEqoeHoH4');
+    }
+
 
 // ==================== MAIN HANDLERS ====================
 
 function handleRequest(e) {
   try {
-    const params = e.parameter;
-    const token = params.token;
-    const docId = params.docId;
-    
+    const params = e && e.parameter ? e.parameter : {};
     let action = params.action || 'append';
     let payload = null;
+
     if (e && e.postData && e.postData.contents) {
       try {
         payload = JSON.parse(e.postData.contents);
-        if (payload.mode) {
+        if (payload && payload.mode) {
           action = payload.mode;
         }
-      } catch (err) {}
+      } catch (err) {
+        // Ignore JSON parse issues; we fall back to URL params.
+      }
     }
 
-    if (!token || !docId) {
-      return createResponse({error: 'Invalid token or docId'}, 400);
-    }
-    
-    switch(action) {
+    switch (action) {
+      case 'health':
+        return createResponse({ status: 'ok' });
+      case 'triggerUpdates':
+        return handleTriggerUpdates(params);
+      case 'listDocs':
+        return handleListDocs(params);
       case 'append':
-        return handleAppend(token, docId, e, payload);
       case 'setConfig':
       case 'applyStatsSettings':
-        return handleSetConfig(token, docId, params, payload);
       case 'registerDoc':
-        return handleRegisterDoc(token, docId, params);
-      case 'updateStats':
-        const doc = DocumentApp.openById(docId);
-        const config = getDocConfig(token, docId);
-        updateStats(doc, config);
-        return createResponse({success: true, message: 'Stats updated'});
+      case 'updateStats': {
+        const token = params.token;
+        const docId = params.docId;
+        if (!token || !docId) {
+          return createResponse({ error: 'Invalid token or docId' }, 400);
+        }
+
+        switch (action) {
+          case 'append':
+            return handleAppend(token, docId, e, payload);
+          case 'setConfig':
+          case 'applyStatsSettings':
+            return handleSetConfig(token, docId, params, payload);
+          case 'registerDoc':
+            return handleRegisterDoc(token, docId, params);
+          case 'updateStats': {
+            const doc = DocumentApp.openById(docId);
+            const config = getDocConfig(token, docId);
+            updateStats(doc, config);
+            return createResponse({ success: true, message: 'Stats updated' });
+          }
+        }
+      }
       default:
-        return createResponse({error: 'Unknown action: ' + action}, 400);
+        return createResponse({ error: 'Unknown action: ' + action }, 400);
     }
   } catch (error) {
     Logger.log('Error in handleRequest: ' + error.toString() + ' Stack: ' + error.stack);
-    return createResponse({error: 'Critical Error: ' + error.toString()}, 500);
+    return createResponse({ error: 'Critical Error: ' + error.toString() }, 500);
   }
 }
 
 function handleAppend(token, docId, e, payload) {
+  const settings = loadHubSettings();
+  const props = settings.props;
+  const tierParam = ((e.parameter && e.parameter.tier) || (payload && payload.tier) || 'free').toString().toLowerCase();
+  const isPaidTier = tierParam === 'essential' || tierParam === 'power' || tierParam === 'paid';
+
+  if (settings.globalSyncSuspended) {
+    return createResponse({ status: 'paused', reason: 'global', message: 'Cloud sync temporarily unavailable' }, 503);
+  }
+  if (!isPaidTier && settings.freeQuotaSuspended) {
+    return createResponse({ status: 'paused', reason: 'free', message: 'Free-tier cloud sync is paused' }, 429);
+  }
+
   const doc = DocumentApp.openById(docId);
   const body = doc.getBody();
   const config = getDocConfig(token, docId);
 
   const content = e.parameter.text || (e.postData ? e.postData.contents : '');
-  if (!content) return createResponse({error: 'No content to append'}, 400);
+  if (!content) return createResponse({ error: 'No content to append' }, 400);
 
   const paras = body.getParagraphs();
   let insertAt = paras.length;
@@ -85,59 +247,100 @@ function handleAppend(token, docId, e, payload) {
     insertAt = paras.length - 1;
   }
 
-  // --- THE FIX ---
-  // Insert the separator and content with blank lines for correct spacing.
-  body.insertParagraph(insertAt,     "—");
-  body.insertParagraph(insertAt + 1, ""); // Adds blank line after separator
+  body.insertParagraph(insertAt, '—');
+  body.insertParagraph(insertAt + 1, '');
   body.insertParagraph(insertAt + 2, content);
-  body.insertParagraph(insertAt + 3, ""); // Adds blank line after content
+  body.insertParagraph(insertAt + 3, '');
 
   updateStats(doc, config);
-  return createResponse({ success: true, message: 'Content appended' });
+  incrementCounter(props, HUB_PROPERTY_KEYS.TOTAL_CLOUD_SENDS);
+  if (isPaidTier) {
+    incrementCounter(props, HUB_PROPERTY_KEYS.PAID_SENDS_TODAY);
+  } else {
+    incrementCounter(props, HUB_PROPERTY_KEYS.FREE_SENDS_TODAY);
+  }
+  props.setProperty(HUB_PROPERTY_KEYS.CONSECUTIVE_ERRORS, '0');
+  return createResponse({ success: true, message: 'Content appended', tier: isPaidTier ? tierParam : 'free' });
 }
 
 function handleSetConfig(token, docId, params, payload) {
-  const configKey = 'config_' + token + '_' + docId;
-  const config = getDocConfig(token, docId);
-  
-  const settingsSource = payload || params;
+    const configKey = 'config_' + token + '_' + docId;
+    const config = getDocConfig(token, docId);
+    const settingsSource = payload || params;
 
-  if (settingsSource.statsTop !== undefined) {
-    config.statsTop = settingsSource.statsTop === true || settingsSource.statsTop === 'true';
-  }
-  if (settingsSource.statsBottom !== undefined) {
-    config.statsBottom = settingsSource.statsBottom === true || settingsSource.statsBottom === 'true';
-  }
-  if (settingsSource.statsAnywhere !== undefined) {
-    config.statsAnywhere = settingsSource.statsAnywhere === true || settingsSource.statsAnywhere === 'true';
-  }
-  if (settingsSource.timezone) config.timezone = settingsSource.timezone;
-  
-  PropertiesService.getScriptProperties().setProperty(configKey, JSON.stringify(config));
-  
-  const doc = DocumentApp.openById(docId);
-  updateStats(doc, config);
-  return createResponse({success: true, config: config});
-}
+    if (settingsSource.statsTop !== undefined) {
+      config.statsTop = settingsSource.statsTop === true || settingsSource.statsTop === 'true';
+    }
+    if (settingsSource.statsBottom !== undefined) {
+      config.statsBottom = settingsSource.statsBottom === true || settingsSource.statsBottom === 'true';
+    }
+    if (settingsSource.statsAnywhere !== undefined) {
+      config.statsAnywhere = settingsSource.statsAnywhere === true || settingsSource.statsAnywhere === 'true';
+    }
+    if (settingsSource.timezone) config.timezone = settingsSource.timezone;
 
-function handleRegisterDoc(token, docId, params) {
-  const configKey = 'config_' + token + '_' + docId;
-  const config = {
-    statsTop: params.statsTop === 'true',
-    statsBottom: params.statsBottom !== 'false',
-    statsAnywhere: params.statsAnywhere === 'true',
-    timezone: params.timezone || 'UTC',
-  };
-  PropertiesService.getScriptProperties().setProperty(configKey, JSON.stringify(config));
-  
-  const doc = DocumentApp.openById(docId);
-  updateStats(doc, config);
-  return createResponse({success: true, message: 'Document registered'});
-}
+    PropertiesService.getScriptProperties().setProperty(configKey, JSON.stringify(config));
+
+    upsertRegistryEntry({
+      token,
+      docId,
+      alias: settingsSource.alias || '',
+      autoIntervalMinutes: settingsSource.autoIntervalMinutes || 5
+    });
+
+    const doc = DocumentApp.openById(docId);
+    updateStats(doc, config);
+    return createResponse({ success: true, config });
+  }
+
+
+function handleRegisterDoc(token, docId, params, payload) {
+    const configKey = 'config_' + token + '_' + docId;
+    const config = {
+      statsTop: params.statsTop === 'true',
+      statsBottom: params.statsBottom !== 'false',
+      statsAnywhere: params.statsAnywhere === 'true',
+      timezone: params.timezone || 'UTC',
+    };
+    PropertiesService.getScriptProperties().setProperty(configKey, JSON.stringify(config));
+
+    upsertRegistryEntry({
+      token,
+      docId,
+      alias: params.alias || (payload && payload.alias) || '',
+      autoIntervalMinutes: params.autoIntervalMinutes || (payload && payload.autoIntervalMinutes) || 5
+    });
+
+    const doc = DocumentApp.openById(docId);
+    updateStats(doc, config);
+    return createResponse({ success: true, message: 'Document registered' });
+  }
+
 
 // ==================== CORE STATS LOGIC (FINAL FLEXIBLE VERSION) ====================
 
-/**
+/*function handleRegisterDoc(token, docId, params, payload) {
+    const configKey = 'config_' + token + '_' + docId;
+    const config = {
+      statsTop: params.statsTop === 'true',
+      statsBottom: params.statsBottom !== 'false',
+      statsAnywhere: params.statsAnywhere === 'true',
+      timezone: params.timezone || 'UTC',
+    };
+    PropertiesService.getScriptProperties().setProperty(configKey, JSON.stringify(config));
+
+    upsertRegistryEntry({
+      token,
+      docId,
+      alias: params.alias || (payload && payload.alias) || '',
+      autoIntervalMinutes: params.autoIntervalMinutes || (payload && payload.autoIntervalMinutes) || 5
+    });
+
+    const doc = DocumentApp.openById(docId);
+    updateStats(doc, config);
+    return createResponse({ success: true, message: 'Document registered' });
+  }
+*
    * Computes the stats block and timers for a doc.
    * Uses a SHA-256 hash of the clean user content to detect edits reliably.
    */
@@ -396,9 +599,131 @@ function formatElapsedTime(ms) {
     return parts.join(', ');
 }
 
-function createResponse(data) {
-  return ContentService.createTextOutput(JSON.stringify(data)).setMimeType(ContentService.MimeType.JSON);
+function createResponse(data, status) {
+  const output = ContentService.createTextOutput(JSON.stringify(data))
+    .setMimeType(ContentService.MimeType.JSON);
+  if (status) {
+    output.setResponseCode(status);
+  }
+  return output;
 }
+
+
+/******************************************************************************
+   * Registry helpers (Google Sheet backing the GitHub Action)
+   ******************************************************************************/
+  const SCRIPT_PROP_REGISTRY_SHEET_ID = 'registrySheetId';
+  const SCRIPT_PROP_REGISTRY_API_KEY  = 'registryApiKey';
+  const REGISTRY_HEADERS = ['Token', 'DocId', 'Alias', 'AutoIntervalMinutes', 'LastAutoRunMs'];
+
+  function getRegistrySheet() {
+    const sheetId = PropertiesService.getScriptProperties().getProperty(SCRIPT_PROP_REGISTRY_SHEET_ID);
+    if (!sheetId) throw new Error('registrySheetId not set. Run setRegistryConfig() first.');
+    const ss = SpreadsheetApp.openById(sheetId);
+    const sheet = ss.getSheetByName('Registry') || ss.getSheets()[0] || ss.insertSheet('Registry');
+    if (sheet.getLastRow() === 0) sheet.appendRow(REGISTRY_HEADERS);
+    return sheet;
+  }
+
+  function upsertRegistryEntry({ token, docId, alias, autoIntervalMinutes }) {
+    const sheet = getRegistrySheet();
+    const values = sheet.getDataRange().getValues();
+    const interval = Math.max(Number(autoIntervalMinutes) || 5, 1);
+
+    let found = false;
+    for (let i = 1; i < values.length; i++) {
+      if ((values[i][0] || '') === token && (values[i][1] || '') === docId) {
+        values[i][2] = alias || values[i][2] || '';
+        values[i][3] = interval;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      values.push([token, docId, alias || '', interval, 0]);
+    }
+    sheet.getRange(1, 1, values.length, values[0].length).setValues(values);
+  }
+
+  function triggerScheduledUpdates() {
+    const sheet = getRegistrySheet();
+    const values = sheet.getDataRange().getValues();
+    if (values.length <= 1) return { updated: 0, skipped: 0, errors: [] };
+
+    const now = Date.now();
+    let updated = 0, skipped = 0;
+    const errors = [];
+
+    for (let i = 1; i < values.length; i++) {
+      const token = values[i][0];
+      const docId = values[i][1];
+      if (!token || !docId) { skipped++; continue; }
+
+      const alias = values[i][2];
+      const intervalMinutes = Math.max(Number(values[i][3]) || 5, 1);
+      const lastAutoRunMs = Number(values[i][4]) || 0;
+      const intervalMs = intervalMinutes * 60 * 1000;
+
+      if (now - lastAutoRunMs < intervalMs) { skipped++; continue; }
+
+      try {
+        const doc = DocumentApp.openById(docId);
+        const config = getDocConfig(token, docId);
+        updateStats(doc, config);
+        values[i][4] = now;
+        updated++;
+      } catch (err) {
+        errors.push({ docId, message: err.message });
+      }
+    }
+
+    sheet.getRange(1, 1, values.length, values[0].length).setValues(values);
+    return { updated, skipped, errors };
+  }
+
+  function handleTriggerUpdates(params) {
+    const props = PropertiesService.getScriptProperties();
+    const expectedKey = props.getProperty(SCRIPT_PROP_REGISTRY_API_KEY);
+    if (!expectedKey) return createResponse({ error: 'registryApiKey not set' }, 500);
+    if (params.apiKey !== expectedKey) return createResponse({ error: 'Forbidden' }, 403);
+
+    const result = triggerScheduledUpdates();
+    return createResponse({ success: true, updated: result.updated, skipped: result.skipped, errors: result.errors });
+  }
+
+  function handleListDocs(params) {
+    const props = PropertiesService.getScriptProperties();
+    const expectedKey = props.getProperty(SCRIPT_PROP_REGISTRY_API_KEY);
+    if (!expectedKey) return createResponse({ error: 'registryApiKey not set' }, 500);
+    if (params.apiKey !== expectedKey) return createResponse({ error: 'Forbidden' }, 403);
+
+    const sheet = getRegistrySheet();
+    const values = sheet.getDataRange().getValues();
+    const docs = [];
+
+    for (let i = 1; i < values.length; i++) {
+      const token = values[i][0];
+      const docId = values[i][1];
+      if (!token || !docId) continue;
+
+      let title = '(doc not found)';
+      try { title = DocumentApp.openById(docId).getName(); } catch (e) {}
+      docs.push({
+        token,
+        docId,
+        alias: values[i][2],
+        autoIntervalMinutes: Number(values[i][3]) || 5,
+        lastAutoRunMs: Number(values[i][4]) || 0,
+        title
+      });
+    }
+
+    return createResponse({ success: true, docs });
+  }
+
+
+
+
 
 /**
  * A dedicated test function to run our sand timer diagnostic.
@@ -498,6 +823,8 @@ function inspectConfigForDoc(docId) {
   }
 }
 
+
+
 function testUpdateStats() {
     const e = {
       parameter: {
@@ -547,3 +874,4 @@ function debugCleanText(docId) {
     Logger.log('Clean text sample:\n' + cleanText.substring(0, Math.min(200, cleanText.length)));
   }
 
+  

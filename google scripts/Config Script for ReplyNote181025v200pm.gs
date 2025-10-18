@@ -37,9 +37,14 @@ function getConfig() {
   const hubUrl = props.getProperty('hubUrl') || 'https://script.google.com/macros/s/AKfycbwfxRw3tfTi_qOtIGIPPREieLnB1KpT7GDXIaIefJfincg89kb-H8kTIbPRXfCoGyRKDg/exec';
   const masterPassword = props.getProperty('masterPassword') || 'sam03';
   
+  // Get nextConfigUrl - defaults to self (current URL)
+  const currentUrl = 'https://script.google.com/macros/s/AKfycbybtpY6MlIg6pN8pMt8bNo9zwfRk4FciM6vAAdreb-4V20RweNQ6giIzPFXjrK5fhgOVQ/exec';
+  const nextConfigUrl = props.getProperty('nextConfigUrl') || currentUrl;
+  
   return createJsonResponse({
     hubUrl: hubUrl,
-    masterPassword: masterPassword
+    masterPassword: masterPassword,
+    nextConfigUrl: nextConfigUrl
   });
 }
 
@@ -79,12 +84,16 @@ function setConfig(e) {
   if (updates.masterPassword) {
     props.setProperty('masterPassword', updates.masterPassword);
   }
+  if (updates.nextConfigUrl) {
+    props.setProperty('nextConfigUrl', updates.nextConfigUrl);
+  }
   
   return createJsonResponse({
     success: true,
     message: 'Configuration updated',
     hubUrl: props.getProperty('hubUrl'),
-    masterPassword: props.getProperty('masterPassword')
+    masterPassword: props.getProperty('masterPassword'),
+    nextConfigUrl: props.getProperty('nextConfigUrl')
   });
 }
 
